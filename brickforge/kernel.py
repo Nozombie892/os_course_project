@@ -6,6 +6,7 @@ import time
 from multiprocessing import Process, Queue, Semaphore
 
 from brickforge import persist, scheduler, shipping, warehouse, sync, banker, memory, monitor
+from brickforge import ipc, signals
 from brickforge.scheduler import Job
 from brickforge.workers import drain, shop_worker
 
@@ -490,24 +491,43 @@ def simulate(layout: dict) -> dict:
     for row in timeline:
         grouped.setdefault(row["shop_id"], []).append(row)
 
+    # 共享内存看板：主进程 / 车间进程 / 守护进程读写同一块物理内存
+    board = ipc.open_board(reset=True)
+    # 管道：每条"车间 → 车间"连线一条单向管道，上游投递批次、下游开工前收取
+    pipes = ipc.make_pipes(layout.get("links") or [])
+    index_of = {s.get("id"): i for i, s in enumerate(shops) if s.get("id")}
+
     t0 = time.time()
     for shop in shops:
+        sid = shop.get("id")
+        ctx = {
+            "index": index_of.get(sid, 0),
+            "slots": slots,
+            "senders": pipes["senders"].get(sid, []),
+            "receivers": pipes["receivers"].get(sid, []),
+        }
         proc = Process(
             target=shop_worker,
-            args=(shop, grouped.get(shop["id"], []), material, report_q),
-            name=f"shop-{shop['id']}",
+            args=(shop, grouped.get(sid, []), material, report_q, 0.03, ctx),
+            name=f"shop-{sid}",
         )
         procs.append(proc)
         proc.start()
+    ipc.close_pipes(pipes)          # 父进程关掉自己那份端点，避免句柄泄漏
     reports = drain(report_q, expected=len(procs), timeout=10)
     for proc in procs:
         proc.join(timeout=2)
         if proc.is_alive():
             proc.terminate()
     elapsed = round(time.time() - t0, 3)
+    board_state = board.snapshot()
+    board.close()
 
     finished = sum(len(r.get("finished") or []) for r in reports)
     blocked = sum(int(r.get("blocked") or 0) for r in reports)
+    tool_waits = sum(int(r.get("tool_waits") or 0) for r in reports)
+    delivered = sum(int(r.get("delivered") or 0) for r in reports)
+    piped_in = sum(len(r.get("received") or []) for r in reports)
     live_pids = [r.get("pid") for r in reports]
 
     pack = warehouse.pack_jobs(
@@ -651,6 +671,12 @@ def simulate(layout: dict) -> dict:
             "semaphore_slots": slots,
             "blocked": blocked,
             "links": links,
+            "pipes": ipc.describe_pipes(pipes),
+            "pipe_delivered": delivered,
+            "pipe_received": piped_in,
+            "thread_jobs_done": finished,
+            "tool_waits": tool_waits,
+            "shm": board_state,
         },
         "production": stats,
         "lab": {
@@ -659,18 +685,28 @@ def simulate(layout: dict) -> dict:
             "sync": {
                 **buffers,
                 "blocked": blocked,
+                "tool_waits": tool_waits,
                 "semaphore_slots": slots,
                 "shop_pids": live_pids,
                 "threads": machine_n,
+                "pipes": ipc.describe_pipes(pipes),
+                "pipe_delivered": delivered,
+                "pipe_received": piped_in,
+                "shm": board_state,
                 "note": sync.describe(blocked, slots, buffers),
             },
+            "signals": signals.capabilities(),
             "warehouse": pack,
             "shipping": route,
             "banker": bank,
             "paging": paging,
             "pcb": monitor.pcb(shops, reports, timeline),
             "syscalls": monitor.syscalls(
-                shops, algo, slots, blocked, bank, paging, sched_m.get("switches") or 0
+                shops, algo, slots, blocked, bank, paging, sched_m.get("switches") or 0,
+                pipes=ipc.describe_pipes(pipes),
+                board=board_state,
+                sigcaps=signals.capabilities(),
+                tool_waits=tool_waits,
             ),
         },
         "notes": _notes(pack, blocked, shops, machine_n, stats, floor),

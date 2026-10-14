@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -14,6 +15,9 @@ LAYOUT = DATA / "factory.json"
 STATUS = DATA / "status.json"
 DAEMON_LOG = DATA / "daemon.log"
 LOCK = DATA / "factory.lock"
+PROCS = DATA / "procs.json"      # 被守护进程的登记表
+HB_DIR = DATA / "heartbeats"     # 车间心跳文件
+PID_FILE = DATA / "daemon.pid"
 
 
 @contextmanager
@@ -83,10 +87,22 @@ def load_status() -> dict:
     return json.loads(STATUS.read_text(encoding="utf-8"))
 
 
-def append_log(line: str) -> None:
-    with file_lock():
-        with DAEMON_LOG.open("a", encoding="utf-8") as fh:
-            fh.write(line.rstrip() + "\n")
+def append_log(line: str, retries: int = 3) -> bool:
+    """追加一行日志。
+
+    文件锁在 Windows 上是"重试 10 次后抛异常"的语义，而守护进程每 2 秒就要
+    写一次日志、还要和仿真进程抢同一把锁。这里做有限重试并吞掉异常，
+    避免一次抢锁失败把守护进程的主循环打穿。
+    """
+    for attempt in range(max(retries, 1)):
+        try:
+            with file_lock():
+                with DAEMON_LOG.open("a", encoding="utf-8") as fh:
+                    fh.write(line.rstrip() + "\n")
+            return True
+        except OSError:
+            time.sleep(0.05 * (attempt + 1))
+    return False
 
 
 def tail_log(n: int = 12) -> list[str]:
@@ -94,6 +110,101 @@ def tail_log(n: int = 12) -> list[str]:
         return []
     lines = DAEMON_LOG.read_text(encoding="utf-8").splitlines()
     return lines[-n:]
+
+
+# ------------------------------------------------------------ 进程登记表 ---
+# 守护进程靠这张表判断"谁应该活着"。车间进程启动时登记、正常结束时注销；
+# 如果表里还留着记录、而对应 pid 已经不在了，就说明它是被异常杀掉的。
+
+
+def _read_procs_raw() -> list[dict]:
+    if not PROCS.exists():
+        return []
+    try:
+        data = json.loads(PROCS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    items = data.get("procs") if isinstance(data, dict) else data
+    return [p for p in (items or []) if isinstance(p, dict)]
+
+
+def _write_procs_raw(items: list[dict]) -> None:
+    PROCS.write_text(
+        json.dumps({"procs": items}, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def load_procs() -> list[dict]:
+    with file_lock():
+        return _read_procs_raw()
+
+
+def save_procs(items: list[dict]) -> None:
+    with file_lock():
+        _write_procs_raw(items)
+
+
+def register_proc(entry: dict, retries: int = 5) -> bool:
+    """登记一个被守护进程（同 pid 覆盖旧记录）。
+
+    多个车间进程会同时登记，文件锁在 Windows 上是"重试若干次后抛异常"的语义，
+    因此这里自带重试：抢不到锁只是登记失败，绝不能让车间进程崩掉。
+    """
+    for attempt in range(max(retries, 1)):
+        try:
+            with file_lock():
+                items = [p for p in _read_procs_raw() if p.get("pid") != entry.get("pid")]
+                items.append(entry)
+                _write_procs_raw(items)
+            return True
+        except OSError:
+            time.sleep(0.05 * (attempt + 1))
+    return False
+
+
+def unregister_proc(pid: int, retries: int = 5) -> bool:
+    """注销登记，返回是否真的删掉了记录。
+
+    正常退出的车间会调用它，因此守护进程不会把"干完活下班"误判成崩溃。
+    """
+    for attempt in range(max(retries, 1)):
+        try:
+            with file_lock():
+                items = _read_procs_raw()
+                keep = [p for p in items if p.get("pid") != pid]
+                if len(keep) == len(items):
+                    return False
+                _write_procs_raw(keep)
+                return True
+        except OSError:
+            time.sleep(0.05 * (attempt + 1))
+    return False
+
+
+def update_proc(pid: int, **fields) -> bool:
+    """就地更新登记项（例如重启后改写 pid）。"""
+    with file_lock():
+        items = _read_procs_raw()
+        hit = False
+        for item in items:
+            if item.get("pid") == pid:
+                item.update(fields)
+                hit = True
+        if hit:
+            _write_procs_raw(items)
+        return hit
+
+
+def heartbeat_age(shop_id: str) -> float | None:
+    """该车间心跳文件距今多少秒；没有心跳文件返回 None。"""
+    path = HB_DIR / f"{shop_id}.hb"
+    if not path.exists():
+        return None
+    try:
+        stamp = float(path.read_text(encoding="utf-8").strip() or "0")
+    except (OSError, ValueError):
+        return None
+    return max(time.time() - stamp, 0.0)
 
 
 def default_layout() -> dict:

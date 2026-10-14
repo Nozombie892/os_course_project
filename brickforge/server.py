@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from brickforge import persist
+from brickforge import ipc, persist, signals
 from brickforge.daemon import start_daemon, stop_daemon
 from brickforge.kernel import simulate
 
@@ -16,6 +17,24 @@ APP = ROOT / "app"
 HOST = "127.0.0.1"
 PORT = 8787
 _DAEMON = None
+
+
+def emergency_stop() -> dict:
+    """急停：给每个在册的车间进程发 STOP 信号（POSIX 上是 SIGTERM）。"""
+    hub = signals.SignalHub("server")
+    sent, failed = [], []
+    for entry in persist.load_procs():
+        pid = entry.get("pid")
+        if not pid:
+            continue
+        row = {"pid": pid, "shop": entry.get("shop_id"), "name": entry.get("name")}
+        (sent if hub.send(pid, signals.STOP) else failed).append(row)
+    persist.append_log(
+        f"{time.strftime('%H:%M:%S')} 急停信号已投递 {len(sent)} 个车间进程"
+        f"（失败 {len(failed)}）"
+    )
+    return {"ok": True, "sent": sent, "failed": failed, "count": len(sent),
+            "caps": signals.capabilities()}
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -33,6 +52,14 @@ class Handler(SimpleHTTPRequestHandler):
             payload = persist.load_status()
             payload["log"] = persist.tail_log()
             return self._json(payload)
+        if path == "/api/procs":
+            return self._json({"procs": persist.load_procs(),
+                               "caps": signals.capabilities()})
+        if path == "/api/board":
+            board = ipc.open_board(reset=False)
+            snap = board.snapshot()
+            board.close()
+            return self._json(snap)
         if path == "/api/health":
             return self._json({"ok": True})
         if path == "/":
@@ -48,6 +75,8 @@ class Handler(SimpleHTTPRequestHandler):
             layout = body or persist.load_layout()
             persist.save_layout(layout)
             return self._json(simulate(layout))
+        if path == "/api/stop":
+            return self._json(emergency_stop())
         if path == "/api/reset":
             return self._json(persist.save_layout(persist.default_layout()))
         self.send_error(404)

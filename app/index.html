@@ -46,6 +46,27 @@
       </div>
       <div class="monitor-hud" id="monitor-hud" hidden></div>
       <p class="struct" id="struct"></p>
+
+      <section class="bench" id="bench">
+        <div class="bench-head">
+          <div class="bench-tabs" id="bench-tabs">
+            <button type="button" data-tab="sched" class="on">调度</button>
+            <button type="button" data-tab="sync">同步</button>
+            <button type="button" data-tab="mem">内存</button>
+            <button type="button" data-tab="dev">设备</button>
+            <button type="button" data-tab="proc">进程</button>
+          </div>
+          <div class="bench-actions">
+            <span class="bench-hint" id="bench-hint">后端会真的跑一遍 OS 算法</span>
+            <button type="button" id="bench-params">参数</button>
+            <button type="button" id="bench-run" class="primary">运行仿真</button>
+          </div>
+        </div>
+        <div class="bench-param-box" id="bench-param-box" hidden></div>
+        <div class="bench-body" id="bench-body">
+          <p class="muted">点右上「运行仿真」：后端把布局交给调度器、银行家算法、页面置换、仓储分配、管道与共享内存真跑一遍，结果会显示在这里。注意每次仿真都会消耗进料区的原料。</p>
+        </div>
+      </section>
     </section>
 
     <aside class="side">
@@ -69,5 +90,6 @@
   </main>
   <script src="js/lab.js"></script>
   <script src="js/app.js"></script>
+  <script src="js/bench.js"></script>
 </body>
 </html>

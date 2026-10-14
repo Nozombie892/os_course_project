@@ -158,6 +158,17 @@
             <tr><td>信号</td><td>急停、下班、守护进程拉起</td><td>SIGTERM / 自定义逻辑信号均可，要能在界面看到。</td></tr>
           </tbody>
         </table>
+
+        <div class="callout">
+          <b>实现状态（已落地）</b>：上表五种机制已全部实现，可在页面底部「实验台 → 同步」页一屏内看到。
+          <ul>
+            <li><b>管道</b>：<code>brickforge/ipc.py</code> 为每条「车间 → 车间」连线建一条单向管道，上游完工即投递批次，下游开工前收取。</li>
+            <li><b>消息队列</b>：<code>multiprocessing.Queue</code> 派工单、回传完工报告。</li>
+            <li><b>共享内存</b>：<code>ipc.Board</code> 用命名共享内存段做全厂看板，按「每个写入者独占一个槽位」避免读改写互相覆盖；主进程、车间进程、守护进程挂的是同一块物理内存。</li>
+            <li><b>信号量 / 锁</b>：库位用跨进程 <code>Semaphore</code>；车间内共享工装用线程信号量做互斥；共享状态用 <code>Lock</code> 保护。</li>
+            <li><b>信号</b>：<code>brickforge/signals.py</code> 统一封装。POSIX 上换班优先用实时信号 <code>SIGRTMIN</code>（<b>可靠信号</b>，会排队不丢失），急停用 <code>SIGTERM</code>，周期任务用 <code>SIGALRM</code>；Windows 无这些信号，降级为软信号，接口不变。</li>
+          </ul>
+        </div>
       </section>
 
       <section id="daemon-plan">
@@ -170,6 +181,25 @@
           <li><b>落盘：</b>每隔数秒把时钟、在制数量、告警写入日志文件（课件示例是每 2 秒写系统时间，我们可以写成班报）。</li>
         </ol>
         <p class="muted">若主界面跑在 Windows、内核仿真跑在 WSL/Linux，守护进程放 Linux 侧更贴课件。若全栈 Web，也必须有一个独立于浏览器的后台常驻进程，不能只拿前端 <code>setInterval</code> 冒充 Daemon。</p>
+
+        <div class="callout">
+          <b>实现状态（已落地）</b>：<code>brickforge/daemon.py</code>
+          <ul>
+            <li><b>创建流程</b>：POSIX 上完成课件的 7 步 —— fork 后父进程退出、setsid、umask、chdir("/")、
+              关闭并从 <code>/dev/null</code> 重定向 0/1/2，然后在独立进程里跑业务循环；另多做一次 fork，避免重新获得控制终端。Windows 无 fork/setsid，退化为「独立进程」。</li>
+            <li><b>保活怎么做</b>：车间进程启动时把 <code>{pid, 车间, 作业, 信号量槽, 看板槽位}</code> 登记进
+              <code>data/procs.json</code>，正常结束时注销自己。守护进程每 2 秒巡视：<b>登记还在、进程却没了</b>才算异常退出，
+              并按登记信息真的新建一个车间进程拉起来（同一车间最多拉 3 次，避免崩溃—重启死循环）。
+              所以日志里的「累计拉起」是真实的重启次数，不会把「干完活正常下班」也算进去。</li>
+            <li><b>存活判定</b>：Windows 上不能用 <code>os.kill(pid, 0)</code> 探活 —— CPython 在该平台会把它变成
+              <code>TerminateProcess</code>，也就是「检查存活」会把进程杀掉；因此改走
+              <code>OpenProcess</code> + <code>GetExitCodeProcess</code>。</li>
+            <li><b>落盘</b>：每 2 秒写 <code>data/daemon.log</code> 与 <code>data/status.json</code>，并把 pid、心跳计数、
+              累计拉起次数写进共享内存看板，供界面读取。写日志自带重试，抢不到文件锁不会把主循环打穿。</li>
+          </ul>
+          <p>演示：<code>python -m tests.test_daemon</code> 会杀掉一个车间进程，日志里随即出现
+            「车间 s1 进程 pid=… 已失联，拉起新进程 pid=…」。</p>
+        </div>
       </section>
 
       <section id="calc">
