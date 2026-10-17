@@ -32,6 +32,7 @@ SLOT_RESTARTS = 2
 SLOT_GOOD = 3
 SLOT_SCRAP = 4
 SLOT_BLOCKED = 5
+SLOT_RELOAD = SLOT_BLOCKED           # 换班信号计数（原先该槽位没人写，复用）
 SLOT_SHOP_BASE = 6
 SHOP_SLOTS = 16                      # 最多登记 16 个车间
 BOARD_SLOTS = SLOT_SHOP_BASE + SHOP_SLOTS
@@ -171,6 +172,7 @@ class Board:
             "daemon_pid": raw[SLOT_DAEMON_PID],
             "daemon_tick": raw[SLOT_DAEMON_TICK],
             "restarts": raw[SLOT_RESTARTS],
+            "reloads": raw[SLOT_RELOAD],
             "good": raw[SLOT_GOOD],
             "scrap": raw[SLOT_SCRAP],
             "blocked": raw[SLOT_BLOCKED],

@@ -12,3 +12,6 @@ data/*.lock
 data/status.json
 data/procs.json
 data/factory.json
+data/run.json
+data/watchdog.json
+*.tmp

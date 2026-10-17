@@ -36,16 +36,38 @@ from brickforge.persist import (
     HB_DIR,
     PID_FILE,
     append_log,
+    drop_proc,
     heartbeat_age,
     load_procs,
+    load_run,
     load_status,
-    save_procs,
+    read_watchdog,
+    replace_proc,
     save_status,
+    write_watchdog,
 )
 
 IS_WINDOWS = os.name == "nt"
 MAX_REVIVES = 3          # 同一车间最多拉起 3 次，避免"崩溃—重启"死循环
 HB_STALE_SECONDS = 6.0   # 心跳过期阈值（只用于展示活性，不用于判定崩溃）
+OWNER_STALE_SECONDS = 15.0  # 主人心跳停这么久，就认为服务端已经没了（≈7 轮巡视）
+
+
+def can_fork_to_background() -> bool:
+    """本进程能不能靠 fork 把自己转成后台守护进程。
+
+    两个前提：POSIX（Windows 没有 fork/setsid），并且当前进程是"可丢弃的"
+    —— 也就是 multiprocessing 派出来的子进程。主线程自己调 fork 会把整个
+    解释器（含父进程的线程、套接字、HTTP 服务）复制一份，那是灾难。
+    """
+    if IS_WINDOWS:
+        return False
+    try:
+        from multiprocessing import parent_process
+
+        return parent_process() is not None
+    except (ImportError, AttributeError):
+        return False
 
 
 # ------------------------------------------------------------ 进程存活检查 ---
@@ -132,6 +154,17 @@ def _redirect_std_to_devnull() -> None:
 
 
 # ------------------------------------------------------------------ 拉起 ---
+def _rebuild_pipes(links: list[dict]) -> tuple[dict, dict[str, list]]:
+    """按登记里的连线重建管道拓扑，返回 (管道包, 各车间写端)。
+
+    原先拉起时 senders/receivers 传的是空列表，被拉起的车间就成了"孤岛"：
+    既不往下游投递，也收不到上游的批次。这里按 data/factory.json 的 links
+    重新建一套，把该车间的写端接回去。
+    """
+    bundle = ipc.make_pipes(links or [])
+    return bundle, dict(bundle.get("senders") or {})
+
+
 def revive(entry: dict) -> Process | None:
     """按登记信息真正重启一个车间进程。"""
     from brickforge.workers import shop_worker
@@ -140,27 +173,41 @@ def revive(entry: dict) -> Process | None:
     if not shop.get("id"):
         return None
     slots = max(int(entry.get("slots") or 1), 1)
+    shop_id = str(shop.get("id"))
+    bundle = None
     try:
         material = Semaphore(slots)
         report_q: Queue = Queue()
-        # 拉起时要把上下文一起复原，否则新进程会退化成"无看板槽位、计数归零"
+        # 上下文要按登记信息复原：槽位、连线、班次、寿命模型
+        links = list(entry.get("links") or [])
+        sender_map: dict = {}
+        if links:
+            bundle, sender_map = _rebuild_pipes(links)
         ctx = {
             "index": int(entry.get("index") or 0),
             "slots": slots,
-            "senders": [],
-            "receivers": [],
+            "senders": sender_map.get(shop_id, []),
+            "receivers": (bundle.get("receivers") or {}).get(shop_id, []) if bundle else [],
             "revives": int(entry.get("revives") or 0) + 1,
+            "run_id": entry.get("run_id"),
+            "run_seconds": float(entry.get("run_seconds") or 0.0),
+            "links": links,
         }
         proc = Process(
             target=shop_worker,
             args=(shop, entry.get("jobs") or [], material, report_q,
                   float(entry.get("tick") or 0.03), ctx),
-            name=f"revive-{shop.get('id')}",
+            name=f"revive-{shop_id}",
         )
         proc.daemon = False
         proc.start()
+        if bundle:
+            # 子进程已经拿到自己的端点副本，父进程这份要关掉，否则句柄泄漏
+            ipc.close_pipes(bundle)
         return proc
     except (OSError, ValueError):
+        if bundle:
+            ipc.close_pipes(bundle)
         return None
 
 
@@ -186,15 +233,50 @@ def daemon_loop(interval: float = 2.0) -> None:
     restarts = 0
     tick = 0
     revived: list[Process] = []
+    # 守护进程也要能被"反向守护"：主人（HTTP 服务）被强杀时，自己得退出去，
+    # 否则关掉控制台/任务管理器结束进程之后会留一个没人管的孤儿守护进程。
+    owner_pid = None
+    owner_beat = None
+    wd = read_watchdog()
+    if wd:
+        owner_pid = int(wd.get("pid") or 0) or None
+        owner_beat = wd
 
     while not state["stop"]:
         tick += 1
         now = time.strftime("%H:%M:%S")
         try:
+            # 换班信号：真的重新读一遍登记表（以前只加计数、没人消费）
+            if state["reload"]:
+                loaded = len(load_procs())
+                append_log(f"{now} 收到换班信号（第 {state['reload']} 次），"
+                           f"重新读取登记表 {loaded} 条")
+                board.bump(ipc.SLOT_RELOAD)
+
+            # 主人还在吗？只对"有主"的守护进程生效（独立脚本起的守护不算）
+            if owner_pid:
+                fresh = read_watchdog()
+                if fresh:
+                    owner_beat = fresh
+                age = time.time() - float((owner_beat or {}).get("at") or 0)
+                if not _alive(owner_pid) or age > OWNER_STALE_SECONDS:
+                    append_log(
+                        f"{now} 主人 pid={owner_pid} 已退出（心跳停在 {age:.0f}s 前），"
+                        f"守护进程随之退出"
+                    )
+                    break
+
             alive_rows, stale_rows, deaths = _inspect()
+            run = load_run()
+            run_id = run.get("run_id") if run.get("state") == "running" else None
             # 真正拉起被异常杀掉的车间
             for entry in deaths:
                 shop_id = entry.get("shop_id") or "?"
+                # 班次已经收工（或这条记录属于上一班）：不是崩溃，直接清掉，别拉起
+                if entry.get("run_id") and entry.get("run_id") != run_id:
+                    _drop(entry.get("pid"))
+                    append_log(f"{now} 车间 {shop_id} 属于已收工的班次，登记已清理（不拉起）")
+                    continue
                 done = int(entry.get("revives") or 0)
                 if done >= MAX_REVIVES:
                     append_log(f"{now} 车间 {shop_id} 连续崩溃 {done} 次，放弃拉起")
@@ -204,13 +286,18 @@ def daemon_loop(interval: float = 2.0) -> None:
                 proc = revive(entry)
                 if proc is not None:
                     restarts += 1
-                    _drop(old_pid)
-                    _append(dict(entry, pid=proc.pid, revives=done + 1, started_at=time.time()))
                     revived.append(proc)
+                    # 一次加锁内完成"删旧 + 写新"，避免和车间进程的登记互相覆盖
+                    replace_proc(old_pid, dict(
+                        entry, pid=proc.pid, revives=done + 1, started_at=time.time()
+                    ))
                     append_log(f"{now} 车间 {shop_id} 进程 pid={old_pid} 已失联，"
                                f"拉起新进程 pid={proc.pid}（第 {done + 1} 次）")
                 else:
                     append_log(f"{now} 车间 {shop_id} 拉起失败")
+
+            # 回收自己拉起的子进程，别留僵尸（僵尸会被 _alive() 误判成"活着"）
+            revived = _reap(revived)
 
             board.bump(ipc.SLOT_DAEMON_TICK)
             board.set(ipc.SLOT_RESTARTS, restarts)
@@ -229,6 +316,7 @@ def daemon_loop(interval: float = 2.0) -> None:
                 "guarded": alive_rows,
                 "stale": stale_rows,
                 "checked_at": now,
+                "run_id": run_id,
                 "signal_caps": signals.capabilities(),
                 "board": board.snapshot(),
             })
@@ -247,22 +335,58 @@ def daemon_loop(interval: float = 2.0) -> None:
                 proc.join(timeout=2)
         except Exception:
             pass
+    revived.clear()
     append_log(f"{time.strftime('%H:%M:%S')} 厂务精灵退出 pid={os.getpid()}")
+    # 自己是自愿退出的，pidfile 自己收拾干净，别留一个指向死进程的文件
+    _clear_pidfile(os.getpid())
     hub.restore()
     board.close()
+
+
+def _reap(children: list[Process]) -> list[Process]:
+    """回收已经结束的子进程（显式 waitpid），返回还活着的那些。
+
+    不回收的话，被拉起的车间退出后会变成僵尸；而 Windows/POSIX 上
+    "僵尸进程"在 _alive() 眼里仍是"活着"，守护进程就不会再拉起它。
+    """
+    alive: list[Process] = []
+    for proc in children:
+        try:
+            if proc.is_alive():
+                alive.append(proc)
+                continue
+            proc.join(timeout=0)
+            if proc.exitcode is not None:
+                try:
+                    os.waitpid(proc.pid, os.WNOHANG)
+                except (OSError, ChildProcessError):
+                    pass
+        except Exception:
+            continue
+    return alive
 
 
 def _drop(pid) -> None:
     if not pid:
         return
-    items = [p for p in load_procs() if p.get("pid") != pid]
-    save_procs(items)
+    drop_proc(int(pid))
 
 
-def _append(entry: dict) -> None:
-    items = [p for p in load_procs() if p.get("pid") != entry.get("pid")]
-    items.append(entry)
-    save_procs(items)
+class _DaemonHandle:
+    """单例命中时的轻量句柄：指向那个已经在跑的守护进程。"""
+
+    def __init__(self, pid: int, reused: bool = True) -> None:
+        self.pid = pid
+        self.reused = reused
+
+    def is_alive(self) -> bool:
+        return _alive(self.pid)
+
+    def join(self, timeout: float | None = None) -> None:
+        return None
+
+    def __repr__(self) -> str:                    # pragma: no cover
+        return f"<daemon pid={self.pid} reused={self.reused}>"
 
 
 def _inspect() -> tuple[list[dict], list[str], list[dict]]:
@@ -294,7 +418,32 @@ def _inspect() -> tuple[list[dict], list[str], list[dict]]:
 
 
 # ------------------------------------------------------------------ 生命周期 ---
-def start_daemon() -> Process:
+def daemon_pid_running() -> int | None:
+    """已有守护进程在跑的话返回它的 pid（单例检查）。"""
+    if not PID_FILE.exists():
+        return None
+    try:
+        pid = int(PID_FILE.read_text(encoding="utf-8").strip() or 0)
+    except (OSError, ValueError):
+        return None
+    return pid if pid > 0 and _alive(pid) else None
+
+
+def start_daemon() -> Process | _DaemonHandle:
+    """启动厂务精灵。
+
+    平台差异（答辩时要讲清楚）：
+        POSIX  —— 子进程再走一遍课件第 9 页的 7 步（fork/setsid/umask/chdir/
+                  关 fd/dup2/业务），彻底脱离终端与父进程。
+        Windows —— 没有 fork/setsid，只能"独立进程"：multiprocessing 起的子进程
+                  本身就是独立进程，但不脱离控制台（控制台关了它也会退）。
+    单例：pidfile 里的 pid 还活着就直接复用它，避免调试时叠出一堆守护进程。
+    """
+    running = daemon_pid_running()
+    if running is not None:
+        return _DaemonHandle(running)
+    # 写下"主人是谁"：守护进程据此在主人被强杀后自己退出，不留孤儿
+    write_watchdog()
     proc = Process(target=_entry, name="factory-daemon", daemon=False)
     proc.start()
     return proc
@@ -302,7 +451,8 @@ def start_daemon() -> Process:
 
 def _entry() -> None:
     try:
-        daemonize_posix()
+        if can_fork_to_background():
+            daemonize_posix()
     except OSError:
         pass
     try:
@@ -313,12 +463,78 @@ def _entry() -> None:
 
 
 def stop_daemon(proc: Process | None) -> None:
-    if proc is not None and proc.is_alive():
-        # POSIX 上 terminate 发的是 SIGTERM，会被守护进程的处理程序接住并优雅退出
-        proc.terminate()
-        proc.join(timeout=3)
+    """停掉厂务精灵（含 POSIX 下已 fork 到后台、不再是 proc 子进程的那种）。
+
+    以前只对 `proc` 发 terminate：POSIX 上 proc 是 fork 前的中间子进程，
+    早已 os._exit(0)，于是真守护进程永远收不到信号、成了孤儿。
+    现在改成按 **pidfile 里的真实 pid** 发 SIGTERM，并确认它真的退出了
+    才删 pidfile；删不掉 pidfile 反而会让下次启动误以为还有守护进程在跑。
+    """
+    targets: list[int] = []
+    if proc is not None:
+        try:
+            if proc.is_alive():
+                targets.append(proc.pid)
+        except (AssertionError, ValueError):
+            pass
+    real = None
     if PID_FILE.exists():
         try:
-            PID_FILE.unlink()
+            real = int(PID_FILE.read_text(encoding="utf-8").strip() or 0) or None
+        except (OSError, ValueError):
+            real = None
+    if real and real not in targets and _alive(real):
+        targets.append(real)
+
+    for pid in targets:
+        _terminate_pid(pid)
+
+    if proc is not None:
+        try:
+            proc.join(timeout=3)
+        except (AssertionError, ValueError):
+            pass
+    if real and _alive(real):
+        return          # 没停掉就别删 pidfile，留给下一次尝试
+    # 停掉了（或本来就已退出）：顺手清掉可能残留的 pidfile
+    _clear_pidfile(real)
+
+
+def _clear_pidfile(expect: int | None = None) -> None:
+    """删掉 pidfile；给了 expect 就只在该 pid 确实是它时删（防误删别人的）。"""
+    if not PID_FILE.exists():
+        return
+    try:
+        current = int(PID_FILE.read_text(encoding="utf-8").strip() or 0)
+    except (OSError, ValueError):
+        current = None
+    if expect is not None and current not in (None, expect):
+        return
+    try:
+        PID_FILE.unlink()
+    except OSError:
+        pass
+
+
+def _terminate_pid(pid: int) -> None:
+    """尽力终止一个进程：POSIX 先 SIGTERM 让处理程序优雅收尾，再 SIGKILL 兜底。"""
+    if not _alive(pid):
+        return
+    if IS_WINDOWS:
+        try:
+            os.kill(pid, 15)      # Windows 上这等价于 TerminateProcess
         except OSError:
             pass
+        return
+    try:
+        os.kill(pid, 15)          # SIGTERM：守护进程的处理程序会接到
+    except OSError:
+        pass
+    for _ in range(30):
+        if not _alive(pid):
+            return
+        time.sleep(0.1)
+    try:
+        os.kill(pid, 9)           # SIGKILL 兜底
+    except OSError:
+        pass

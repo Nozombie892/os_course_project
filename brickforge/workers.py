@@ -35,6 +35,22 @@ def beat(shop_id: str) -> None:
         pass
 
 
+def run_alive(run_id: str | None) -> bool:
+    """长跑班次是否还该继续。
+
+    守护进程和运行时都靠 data/run.json 判断。班次一旦被宣布收工，
+    车间进程自己就会退出，不会等守护进程把"正常收工"错当崩溃再拉起来。
+    """
+    if not run_id:
+        return True
+    try:
+        from brickforge import persist
+
+        return persist.active_run_id() == run_id
+    except Exception:
+        return False
+
+
 def shop_worker(
     shop: dict,
     jobs: list[dict],
@@ -46,12 +62,22 @@ def shop_worker(
     """一个车间进程的主体。
 
     material 是跨进程信号量（库位）；ctx 携带看板槽位与管道端点。
+
+    两种寿命模型（ctx 决定）：
+        一锤子  ctx 里没有 run_seconds、run_id —— 做完这批工单就正常注销退出，
+                这是 /api/simulate 的用法，一次仿真 = 一个班次。
+        长跑    ctx 里有 run_seconds、run_id —— 车间反复消化工单，直到班次收工
+                或收到急停信号才退出。**持续生产时车间进程才活得过守护进程的
+                巡视间隔，守护进程才有活可干（见 README 的守护进程演示）。**
     """
     ctx = ctx or {}
     shop_id = shop.get("id") or "shop"
     index = int(ctx.get("index") or 0)
     senders = ctx.get("senders") or []
     receivers = ctx.get("receivers") or []
+    run_id = ctx.get("run_id")
+    run_seconds = max(float(ctx.get("run_seconds") or 0.0), 0.0)
+    long_run = bool(run_id and run_seconds > 0)
 
     # ---- 信号处理程序：急停 -------------------------------------------------
     hub = signals.SignalHub(f"shop-{shop_id}")
@@ -77,6 +103,9 @@ def shop_worker(
             "index": index,
             "tick": float(tick),
             "revives": int(ctx.get("revives") or 0),
+            "run_id": run_id,
+            "run_seconds": run_seconds,
+            "links": list(ctx.get("links") or []),
         }
     )
 
@@ -91,12 +120,42 @@ def shop_worker(
     blocked = 0
     tool_waits = 0
     delivered = 0
+    cursor = 0
     machines = shop.get("machines") or [{"id": "idle", "burst": 1}]
 
-    def machine_loop(machine: dict, assigned: list[dict]) -> None:
+    def take_job():
+        """从工单池里取一件。长跑时取完一轮就复用，持续生产。
+
+        取活时就把游标推进（在锁里），否则两个线程会领到同一件工单。
+        一锤子模式下取完就返回 None —— 不能偷偷多产，否则产量对不上。
+        """
+        nonlocal cursor
+        with state_lock:
+            if not jobs:
+                return None
+            if cursor >= len(jobs):
+                if not long_run:
+                    return None
+                cursor = 0
+            job = dict(jobs[cursor])
+            cursor += 1
+            return job
+
+    def done() -> bool:
+        if stop["flag"]:
+            return True
+        if long_run:
+            return not run_alive(run_id)
+        return False
+
+    def machine_loop(machine: dict, assigned: list[dict] | None) -> None:
         nonlocal blocked, tool_waits, delivered
-        for job in assigned:
-            if stop["flag"]:
+        pool = list(assigned) if assigned is not None else None
+        while not done():
+            # 一锤子模式：只吃自己分到的那批，吃完就退（不能多产）
+            # 长跑模式：从车间共享工单池里领活，领完一轮再复用（持续生产）
+            job = pool.pop(0) if pool else (take_job() if long_run else None)
+            if job is None:
                 return
             beat(shop_id)
             # 同步一：抢占库位（跨进程信号量）
@@ -122,13 +181,13 @@ def shop_worker(
             # 线程同步：保护共享的完工列表
             with state_lock:
                 finished.append(
-                    {"job": job["id"], "machine": machine.get("id"), "shop": shop_id}
+                    {"job": job.get("id"), "machine": machine.get("id"), "shop": shop_id}
                 )
                 # 管道投递：完工一件就通知下游。等全部做完再发，下游往往已经收工了
                 if senders:
                     delivered += ipc.deliver(
                         senders,
-                        {"from": shop_id, "count": 1, "jobs": [job["id"]],
+                        {"from": shop_id, "count": 1, "jobs": [job.get("id")],
                          "at": round(time.time(), 3)},
                     )
             # 线程通信：把完工件数写进共享内存看板（每个车间独占一个槽位）
@@ -136,7 +195,22 @@ def shop_worker(
             beat(shop_id)
 
     threads: list[Thread] = []
-    if not jobs:
+    if long_run:
+        # 持续生产：每台机器各跑一个线程，从同一个工单池里循环取活
+        for machine in machines:
+            th = Thread(target=machine_loop, args=(machine, None), daemon=True)
+            threads.append(th)
+            th.start()
+        deadline = time.time() + run_seconds
+        while threads and time.time() < deadline and not done():
+            beat(shop_id)
+            time.sleep(0.1)
+            threads = [t for t in threads if t.is_alive()]
+        # 班次到点或收工：让线程在下一个循环里自己看到 done()
+        stop["flag"] = True
+        for th in threads:
+            th.join(timeout=2.0)
+    elif not jobs:
         beat(shop_id)
     else:
         chunks: list[list[dict]] = [[] for _ in machines]
@@ -161,6 +235,8 @@ def shop_worker(
             "stopped": stop["flag"],
             "signals": hub.snapshot()["received"],
             "pid": my_pid,
+            "run_id": run_id,
+            "long_run": long_run,
         }
     )
     # ---- 正常结束：注销登记，守护进程不会把我误判成崩溃 ---------------------

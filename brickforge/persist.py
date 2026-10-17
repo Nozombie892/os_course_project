@@ -18,6 +18,66 @@ LOCK = DATA / "factory.lock"
 PROCS = DATA / "procs.json"      # 被守护进程的登记表
 HB_DIR = DATA / "heartbeats"     # 车间心跳文件
 PID_FILE = DATA / "daemon.pid"
+RUN = DATA / "run.json"          # 长跑（持续生产）班次状态
+WATCHDOG = DATA / "watchdog.json"  # 守护进程反过来盯"主人"（HTTP 服务）是否还活着
+
+
+def write_watchdog(pid: int | None = None) -> None:
+    """服务端周期性写一次"我还活着"，守护进程读它判断主人是否已经走了。
+
+    只能靠 pid+心跳时间：服务器被强杀（关控制台、任务管理器结束进程）时
+    不会走任何退出路径，守护进程只凭 os.kill(0) 也分不清"pid 还在"是不是
+    复用给了别的进程，加上心跳时间就不会误判。
+    """
+    payload = {"pid": pid or os.getpid(), "at": time.time()}
+    try:
+        with file_lock():
+            _atomic_write_text(WATCHDOG, json.dumps(payload), sync=True)
+    except OSError:
+        pass
+
+
+def read_watchdog() -> dict | None:
+    if not WATCHDOG.exists():
+        return None
+    try:
+        with file_lock():
+            data = json.loads(WATCHDOG.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def clear_watchdog() -> None:
+    try:
+        with file_lock():
+            if WATCHDOG.exists():
+                WATCHDOG.unlink()
+    except OSError:
+        pass
+
+
+def _atomic_write_text(path: Path, text: str, sync: bool = False) -> None:
+    """原子写：临时文件 → flush/fsync → os.replace。
+
+    落盘过程中任何一刻断电/崩溃，读到的要么是旧的完整文件，要么是新的
+    完整文件，不会是"写了一半的 JSON"。临时文件名带 pid，避免并发进程
+    抢同一个 .tmp 互相覆盖（锁已经串行化了，这里再兜一层）。
+    """
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+            fh.flush()
+            if sync:
+                os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 @contextmanager
@@ -72,19 +132,28 @@ def load_layout() -> dict:
 
 def save_layout(layout: dict) -> dict:
     with file_lock():
-        LAYOUT.write_text(json.dumps(layout, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_text(LAYOUT, json.dumps(layout, ensure_ascii=False, indent=2))
     return layout
 
 
 def save_status(payload: dict) -> None:
     with file_lock():
-        STATUS.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_text(STATUS, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def load_status() -> dict:
-    if not STATUS.exists():
-        return {}
-    return json.loads(STATUS.read_text(encoding="utf-8"))
+    """读状态快照。
+
+    也拿文件锁：写入方是原子替换的，但读取方仍需与"读取期间的替换"串行化，
+    否则 Windows 上偶发 replace 失败（文件正被读句柄占着）。
+    """
+    with file_lock():
+        if not STATUS.exists():
+            return {}
+        try:
+            return json.loads(STATUS.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
 
 
 def append_log(line: str, retries: int = 3) -> bool:
@@ -108,7 +177,10 @@ def append_log(line: str, retries: int = 3) -> bool:
 def tail_log(n: int = 12) -> list[str]:
     if not DAEMON_LOG.exists():
         return []
-    lines = DAEMON_LOG.read_text(encoding="utf-8").splitlines()
+    try:
+        lines = DAEMON_LOG.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
     return lines[-n:]
 
 
@@ -129,9 +201,28 @@ def _read_procs_raw() -> list[dict]:
 
 
 def _write_procs_raw(items: list[dict]) -> None:
-    PROCS.write_text(
-        json.dumps({"procs": items}, ensure_ascii=False, indent=2), encoding="utf-8"
+    _atomic_write_text(
+        PROCS, json.dumps({"procs": items}, ensure_ascii=False, indent=2), sync=True
     )
+
+
+def _mutate_procs(fn, retries: int = 5) -> tuple[bool, object]:
+    """在**同一把锁**里完成读-改-写，返回 (是否落盘, fn 的返回值)。
+
+    以前守护进程是 load_procs() 拿一次锁、save_procs() 再拿一次锁，
+    两次加锁之间别的车间进程 register_proc() 的结果会被覆盖回去。
+    """
+    for attempt in range(max(retries, 1)):
+        try:
+            with file_lock():
+                items = _read_procs_raw()
+                changed, result = fn(items)
+                if changed:
+                    _write_procs_raw(items)
+                return bool(changed), result
+        except OSError:
+            time.sleep(0.05 * (attempt + 1))
+    return False, None
 
 
 def load_procs() -> list[dict]:
@@ -195,6 +286,73 @@ def update_proc(pid: int, **fields) -> bool:
         return hit
 
 
+def drop_proc(pid: int) -> bool:
+    """删掉一条登记（守护进程丢掉已放弃拉起的记录时用）。"""
+    if not pid:
+        return False
+
+    def _drop(items: list[dict]) -> tuple[bool, bool]:
+        keep = [p for p in items if p.get("pid") != pid]
+        items[:] = keep
+        return len(keep) != len(items), True
+
+    changed, _ = _mutate_procs(_drop)
+    return changed
+
+
+def replace_proc(old_pid: int, entry: dict) -> bool:
+    """把 old_pid 那条记录换成 entry（拉起成功后改写登记，一次加锁完成）。"""
+    def _replace(items: list[dict]) -> tuple[bool, bool]:
+        keep = [p for p in items if p.get("pid") != old_pid and p.get("pid") != entry.get("pid")]
+        keep.append(entry)
+        items[:] = keep
+        return True, True
+
+    changed, _ = _mutate_procs(_replace)
+    return changed
+
+
+def purge_procs(keep_run: str | None = None) -> int:
+    """清空登记表；给了 keep_run 就只保留该班次的记录。"""
+    def _purge(items: list[dict]) -> tuple[bool, int]:
+        if keep_run is None:
+            dropped = len(items)
+            items.clear()
+            return dropped > 0, dropped
+        keep = [p for p in items if p.get("run_id") == keep_run]
+        dropped = len(items) - len(keep)
+        items[:] = keep
+        return dropped > 0, dropped
+
+    _, dropped = _mutate_procs(_purge)
+    return int(dropped or 0)
+
+
+# ------------------------------------------------------------ 长跑班次状态 ---
+# 守护进程靠它区分"这个班次还在跑，死了要拉起"和"班长已经宣布收工，别再拉"。
+# 没有这一层，运行时主动停掉车间后，守护进程会把它们当成崩溃重新拉起来。
+
+def load_run() -> dict:
+    with file_lock():
+        if not RUN.exists():
+            return {"run_id": None, "state": "idle"}
+        try:
+            return json.loads(RUN.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"run_id": None, "state": "idle"}
+
+
+def save_run(payload: dict) -> dict:
+    with file_lock():
+        _atomic_write_text(RUN, json.dumps(payload, ensure_ascii=False, indent=2), sync=True)
+    return payload
+
+
+def active_run_id() -> str | None:
+    run = load_run()
+    return run.get("run_id") if run.get("state") == "running" else None
+
+
 def heartbeat_age(shop_id: str) -> float | None:
     """该车间心跳文件距今多少秒；没有心跳文件返回 None。"""
     path = HB_DIR / f"{shop_id}.hb"
@@ -205,7 +363,6 @@ def heartbeat_age(shop_id: str) -> float | None:
     except (OSError, ValueError):
         return None
     return max(time.time() - stamp, 0.0)
-
 
 def default_layout() -> dict:
     return {

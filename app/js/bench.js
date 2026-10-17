@@ -11,7 +11,7 @@
 (function () {
   "use strict";
 
-  const state = { result: null, tab: "sched", busy: false, status: null };
+  const state = { result: null, tab: "sched", busy: false, status: null, run: null };
 
   const PARAMS = [
     { key: "scheduler", label: "处理机调度", type: "select",
@@ -235,14 +235,52 @@
     </div>`;
   }
 
-  const TABS = { sched: tabSched, sync: tabSync, mem: tabMem, dev: tabDev, proc: tabProc };
+  function tabGuard(r) {
+    const run = state.run || {};
+    const procs = run.procs || [];
+    const guarded = (run.guarded || []).length;
+    const log = (run.log || []).slice(-8).reverse();
+    const rows = procs.map((p) => [
+      p.pid, p.shop_id, p.name, p.state === "running" ? "运行中" : "已失联",
+      p.heartbeat_age == null ? "—" : p.heartbeat_age + "s", p.revives,
+      p.state === "running" ? `<button type="button" class="kill" data-shop="${esc(p.shop_id)}">杀掉它</button>` : "—",
+    ]);
+    const head = `<div class="run-bar">
+      <span class="run-pill ${run.state === "running" ? "on" : ""}">班次：${run.state === "running" ? "生产中" : "空闲"}</span>
+      <span class="run-pill">守护中：<b>${guarded}</b> 个车间进程</span>
+      <span class="run-pill">守护进程 pid：${(state.status && state.status.daemon_pid) || "—"}</span>
+      <span class="run-pill">累计拉起：${(state.status && state.status.restarts) || 0}</span>
+      <button type="button" id="run-start" class="primary">开始长跑生产</button>
+      <button type="button" id="run-kill">杀掉一个车间</button>
+      <button type="button" id="run-stop">收工</button>
+    </div>`;
+    return `${head}
+      <div class="bench-grid">
+        <div><h4>被守护的进程（登记表 data/procs.json）</h4>
+          ${rows.length
+            ? table(["pid", "车间", "名称", "状态", "心跳", "已拉起", ""], rows)
+            : `<p class="muted">还没有班次。点「开始长跑生产」：每个车间会起一个常驻进程，
+                守护进程每 2 秒巡视一次；然后点「杀掉一个车间」，2 秒内它就会按登记信息被拉起。</p>`}
+          <p class="muted">这就是课件第 7—12 页要求的守护进程：<b>确保指定进程运行</b>。
+            杀掉进程 = 软件崩溃，拉起 = 守护进程帮你重启。日志见右侧。</p>
+        </div>
+        <div><h4>data/daemon.log（最近 ${log.length} 行）</h4>
+          <pre class="bench-sys">${esc(log.join("\n") || "（还没有日志）")}</pre>
+          <button type="button" id="run-refresh">刷新</button>
+        </div>
+      </div>`;
+  }
+
+  const TABS = { sched: tabSched, sync: tabSync, mem: tabMem, dev: tabDev, proc: tabProc, guard: tabGuard };
 
   // ---------------------------------------------------------------- 渲染 ---
   function render() {
     const box = $("bench-body");
     if (!box) return;
-    if (!state.result) return;
-    box.innerHTML = TABS[state.tab](state.result);
+    // 「守护」页不依赖一次仿真的结果，别的页需要
+    if (!state.result && state.tab !== "guard") return;
+    box.innerHTML = TABS[state.tab](state.result || { lab: {}, ipc: {}, production: {} });
+    bindGuard();
   }
 
   function setHint(text, tone) {
@@ -258,6 +296,76 @@
     } catch (err) {
       state.status = null;
     }
+  }
+
+  async function refreshRun() {
+    try {
+      state.run = await api("/api/run");
+    } catch (err) {
+      state.run = null;
+    }
+  }
+
+  // ------------------------------------------------------------ 守护页绑定 ---
+  function bindGuard() {
+    const start = $("run-start");
+    if (start) start.addEventListener("click", async () => {
+      setHint("正在起长跑班次…");
+      try {
+        const body = { shop_seconds: 120, tick: 0.4 };
+        if (window.layout) body.layout = window.layout;
+        const res = await api("/api/run", "POST", body);
+        state.run = res;
+        await refreshStatus();
+        render();
+        setHint(res.ok ? `班次 ${res.run_id || ""} 已开始，守护中 ${(res.guarded || []).length} 个车间` : "起班失败：" + (res.error || ""),
+          res.ok ? "ok" : "bad");
+      } catch (err) {
+        setHint("起班失败：" + err.message, "bad");
+      }
+    });
+    const kill = $("run-kill");
+    if (kill) kill.addEventListener("click", async () => {
+      try {
+        const res = await api("/api/kill", "POST", {});
+        setHint(res.ok ? `已杀掉 ${res.killed.shop_id}（pid ${res.killed.pid}），等守护进程 2 秒内拉起` : (res.error || "没有可杀的进程"),
+          res.ok ? "ok" : "bad");
+        await refreshRun();
+        render();
+      } catch (err) {
+        setHint("杀掉失败：" + err.message, "bad");
+      }
+    });
+    const stop = $("run-stop");
+    if (stop) stop.addEventListener("click", async () => {
+      try {
+        state.run = await api("/api/run/stop", "POST", {});
+        await refreshStatus();
+        render();
+        setHint("班次已收工", "ok");
+      } catch (err) {
+        setHint("收工失败：" + err.message, "bad");
+      }
+    });
+    const refresh = $("run-refresh");
+    if (refresh) refresh.addEventListener("click", async () => {
+      await refreshRun();
+      await refreshStatus();
+      render();
+    });
+    document.querySelectorAll("#bench-body button.kill").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        try {
+          const res = await api("/api/kill", "POST", { shop_id: btn.dataset.shop });
+          setHint(res.ok ? `已杀掉车间 ${btn.dataset.shop}，等守护进程拉起` : (res.error || "失败"),
+            res.ok ? "ok" : "bad");
+          await refreshRun();
+          render();
+        } catch (err) {
+          setHint("杀掉失败：" + err.message, "bad");
+        }
+      });
+    });
   }
 
   async function runSim() {
@@ -326,11 +434,15 @@
   function bind() {
     const tabs = $("bench-tabs");
     if (tabs) {
-      tabs.addEventListener("click", (e) => {
+      tabs.addEventListener("click", async (e) => {
         const btn = e.target.closest("button[data-tab]");
         if (!btn) return;
         state.tab = btn.dataset.tab;
         tabs.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b === btn));
+        if (state.tab === "guard") {
+          await refreshRun();
+          await refreshStatus();
+        }
         render();
       });
     }
