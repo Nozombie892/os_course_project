@@ -58,8 +58,10 @@
 .worker   { --tone: #0284c7; }
 
 * { box-sizing: border-box; }
-html, body { margin: 0; height: 100%; }
+/* 不再把整页钉死在屏幕高度：内容超出一屏时整页可滚，否则最下面会被裁掉且滚不到 */
+html, body { margin: 0; }
 body {
+  min-height: 100vh;
   color: var(--ink);
   font-family: var(--sans);
   font-size: 14px;
@@ -158,7 +160,8 @@ h3 { font-size: 13px; }
   grid-template-columns: 168px minmax(0, 1fr) 288px;
   gap: 14px;
   padding: 14px;
-  height: calc(100vh - 60px);
+  /* 至少占满一屏（保持原来的仪表盘观感），内容多了就让整页滚动 */
+  min-height: calc(100vh - 60px);
 }
 .side { overflow: auto; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
 .center { min-width: 0; display: flex; flex-direction: column; min-height: 0; gap: 10px; }
