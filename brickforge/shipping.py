@@ -37,7 +37,14 @@ def cscan_route(dests: list[int], start: int = 0) -> dict:
     lefts = [d for d in left if d < start]
     path.extend(right)
     path.extend(lefts)
-    return _score(path)
+    result = _score(path)
+    if lefts:
+        # C-SCAN 扫到最右端后要跳回 0 再继续向上扫。这一段寻道是真实发生的，
+        # 但 0 不是目的地，所以不进 path；距离上补回来（多走 2×最小左向目标）。
+        # 起点为 0 时 lefts 必为空，走不到这里，SCAN 与 C-SCAN 因此完全等价。
+        result["jump_to_zero"] = 2 * lefts[0]
+        result["distance"] += result["jump_to_zero"]
+    return result
 
 
 def run(dests: list[int], algo: str = "sstf", start: int = 0) -> dict:

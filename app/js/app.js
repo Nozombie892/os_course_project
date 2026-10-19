@@ -50,6 +50,15 @@ const crumb = document.getElementById("crumb");
 
 function snap(v) { return Math.round(v / GRID) * GRID; }
 function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+// 车间/机器/货物名字都是用户输入的，拼进 innerHTML 前必须转义，
+// 否则名字里写个 <img onerror=...> 就会在页面上执行。
+function escHtml(value) {
+  return String(value == null ? "" : value).replace(/[&<>"']/g, (ch) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]
+  ));
+}
+
 function currentShop() { return layout.shops.find((s) => s.id === view.id); }
 function nid(prefix) { uid += 1; return prefix + uid + "-" + Date.now().toString(36); }
 
@@ -878,13 +887,13 @@ function drawDockPanels(shop) {
   wrap.innerHTML =
     `<div class="inlet dock${feed ? "" : " cut"}">
       <span class="label">原料</span>
-      <strong>${feed || "未进料"}</strong>
+      <strong>${escHtml(feed || "未进料")}</strong>
       <em>${feed ? fmtPpm(inPpm) + " 件/分" : "接到机器"}</em>
       <span class="port right" role="button" title="接到机器"></span>
     </div>
     <div class="outlet dock${ship ? "" : " cut"}">
       <span class="label">出货</span>
-      <strong>${ship || "未出货"}</strong>
+      <strong>${escHtml(ship || "未出货")}</strong>
       <em>${ship ? fmtPpm(outPpm) + " 件/分" : "接到这里"}</em>
       <span class="port left" role="button" title="接出货"></span>
     </div>`;
@@ -1188,7 +1197,7 @@ function renderPalette() {
 
 function pieceHTML(title, role, extra) {
   return `<div class="studs"><i></i><i></i><i></i></div>
-    <div class="body"><strong>${title}</strong><em>${role}</em>${extra || ""}</div>`;
+    <div class="body"><strong>${escHtml(title)}</strong><em>${role}</em>${extra || ""}</div>`;
 }
 
 function crewHTML(item) {
@@ -1325,11 +1334,11 @@ function crateHTML(item, kind) {
   const qty = Math.max(Number(item.qty) || 0, 0);
   const tone = kind === "in" ? stockTone(qty, cap) : pileTone(qty, cap);
   const pct = Math.round(Math.min(qty / cap, 1) * 100);
-  return `<div class="crate" data-id="${item.id}">
+  return `<div class="crate" data-id="${escHtml(item.id)}">
     ${kind === "in"
       ? `<span class="port right" role="button" title="拉到车间"></span>`
       : `<span class="port left" role="button" title="接到出货"></span>`}
-    <input class="bay-name" value="${String(item.name || "").replace(/"/g, "&quot;")}" title="货物名称" />
+    <input class="bay-name" value="${escHtml(item.name || "")}" title="货物名称" />
     <div class="row">
       <input class="bay-qty" type="number" min="0" value="${qty}" title="${kind === "in" ? "库存" : "堆积"}" />
       <button type="button" class="odel" title="去掉">×</button>
@@ -1710,8 +1719,8 @@ function drawPiece(item, level, graph) {
     if (downs.length) el.classList.add("down");
     extra = `<span class="port left" role="button" title="接进料" aria-label="接进料"></span>
       <span class="port right" role="button" title="接出货" aria-label="接出货"></span>
-      <div class="feed-tag ${feed ? "ok" : "cut"}">${feed ? "原料 " + feed : "未进料"}</div>
-      <div class="feed-tag ship ${ship ? "ok" : "cut"}">${ship ? "出货 " + ship : "未出货"}</div>
+      <div class="feed-tag ${feed ? "ok" : "cut"}">${feed ? "原料 " + escHtml(feed) : "未进料"}</div>
+      <div class="feed-tag ship ${ship ? "ok" : "cut"}">${ship ? "出货 " + escHtml(ship) : "未出货"}</div>
       ${downs.length ? `<div class="fault-flag">${downs.length}台故障</div>` : ""}
       <button class="enter" type="button">${downs.length ? "去监控" : "进入"}</button>`;
   } else {
@@ -2465,7 +2474,17 @@ function bind() {
 }
 
 async function boot() {
-  layout = await api("/api/layout");
+  try {
+    layout = await api("/api/layout");
+  } catch (err) {
+    // 服务没起来时以前是未捕获的 Promise 拒绝：页面一片空白，控制台才有线索
+    const note = document.getElementById("m-note");
+    if (note) {
+      note.textContent = "连不上后端（" + err.message + "）。请确认 `python -m brickforge` 还在运行，然后刷新页面。";
+    }
+    setTicker("后端未连接");
+    return;
+  }
   window.layout = layout;
   writeControls();
   renderPalette();

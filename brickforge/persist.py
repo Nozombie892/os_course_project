@@ -67,15 +67,26 @@ def _atomic_write_text(path: Path, text: str, sync: bool = False) -> None:
     落盘过程中任何一刻断电/崩溃，读到的要么是旧的完整文件，要么是新的
     完整文件，不会是"写了一半的 JSON"。临时文件名带 pid，避免并发进程
     抢同一个 .tmp 互相覆盖（锁已经串行化了，这里再兜一层）。
+
+    os.replace 在 Windows 上可能因为目标文件被**别的进程**短暂打开
+    （记事本、杀毒、另一个终端在读日志）而抛 WinError 5。实测偶发过一次：
+    请求直接断连、前端只看到"网络错误"。这里重试几次兜住。
     """
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(text)
-            fh.flush()
-            if sync:
-                os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        for attempt in range(6):
+            try:
+                with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(text)
+                    fh.flush()
+                    if sync:
+                        os.fsync(fh.fileno())
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt >= 5:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
     finally:
         if tmp.exists():
             try:

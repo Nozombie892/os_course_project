@@ -464,12 +464,146 @@ def _to_int(value, default: int, minimum: int | None = None) -> int:
     return number
 
 
+def _to_num(value, default: float = 0.0) -> float:
+    """坐标这类"可以是小数"的字段：坏值回落默认。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _as_dicts(value, key: str, fixes: list[str]) -> list[dict]:
+    """把 value 规整成"元素都是对象的数组"，并记下改了什么。"""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        fixes.append(f"{key} 不是数组，已清空")
+        return []
+    good = [item for item in value if isinstance(item, dict)]
+    if len(good) != len(value):
+        fixes.append(f"{key} 里有 {len(value) - len(good)} 项不是对象，已丢弃")
+    return good
+
+
+def sanitize_layout(layout: dict) -> list[str]:
+    """把布局里形状不对的字段就地纠正，返回纠正说明。
+
+    factory.json 是手改的、也能直接 POST 进来。以前只校验"顶层是对象"，
+    嵌套写错（"shops": "abc"、"jobs": {...}、"shelves": ["a"]、"quantum": "abc"…）
+    会让 simulate 抛异常，服务端连响应都写不出来，前端只看到"网络错误"。
+    这里把能猜的猜回来、猜不回来的清空，保证 simulate 无论如何都能跑完。
+    """
+    if not isinstance(layout, dict):
+        return ["布局不是对象"]
+    fixes: list[str] = []
+
+    # ---- 车间 / 机器 / 传送带 ----
+    shops = _as_dicts(layout.get("shops"), "shops", fixes)
+    layout["shops"] = shops
+    used_shop_ids: set[str] = set()
+    for i, shop in enumerate(shops):
+        sid = str(shop.get("id") or "").strip() or f"s{i + 1}"
+        while sid in used_shop_ids:
+            sid = f"{sid}-{i + 1}"
+        if shop.get("id") != sid:
+            fixes.append(f"车间 id 缺失或重复，已改成 {sid}")
+            shop["id"] = sid
+        used_shop_ids.add(sid)
+        shop["x"] = _to_num(shop.get("x"))
+        shop["y"] = _to_num(shop.get("y"))
+
+        machines = _as_dicts(shop.get("machines"), f"车间 {sid} 的 machines", fixes)
+        seen_m: set[str] = set()
+        for j, machine in enumerate(machines):
+            mid = str(machine.get("id") or "").strip() or f"{sid}-m{j + 1}"
+            while mid in seen_m:
+                mid = f"{mid}-{j + 1}"
+            if machine.get("id") != mid:
+                fixes.append(f"机器 id 缺失或重复，已改成 {mid}")
+                machine["id"] = mid
+            seen_m.add(mid)
+            machine["x"] = _to_num(machine.get("x"))
+            machine["y"] = _to_num(machine.get("y"))
+            machine["workers"] = max(_to_int(machine.get("workers"), 0), 0)
+        shop["machines"] = machines
+
+        wires = _as_dicts(shop.get("wires"), f"车间 {sid} 的 wires", fixes)
+        good = [w for w in wires if w.get("from") and w.get("to")]
+        if len(good) != len(wires):
+            fixes.append(f"车间 {sid} 有 {len(wires) - len(good)} 条传送带缺 from/to，已丢弃")
+        shop["wires"] = good
+
+    # ---- 工单：id 必须唯一，否则调度器按 id 建字典时会把两张工单合并 ----
+    jobs = _as_dicts(layout.get("jobs"), "jobs", fixes)
+    layout["jobs"] = jobs
+    seen_j: set[str] = set()
+    for i, job in enumerate(jobs):
+        jid = str(job.get("id") or "").strip() or f"j{i + 1}"
+        base, n = jid, 2
+        while jid in seen_j:
+            jid = f"{base}-{n}"
+            n += 1
+        if job.get("id") != jid:
+            fixes.append(f"工单 id 缺失或重复，已改成 {jid}")
+            job["id"] = jid
+        seen_j.add(jid)
+
+    # ---- 厂区连线 ----
+    for key in ("feeds", "ships", "links"):
+        items = _as_dicts(layout.get(key), key, fixes)
+        good = [row for row in items if row.get("from") and row.get("to")]
+        if len(good) != len(items):
+            fixes.append(f"{key} 里有 {len(items) - len(good)} 条缺 from/to，已丢弃")
+        layout[key] = good
+
+    # ---- 进料区 / 出货区 ----
+    for key in ("inbound", "outbound"):
+        bay = layout.get(key)
+        if not isinstance(bay, dict):
+            if bay is not None:
+                fixes.append(f"{key} 不是对象，已重置")
+            layout[key] = {}
+            continue
+        items = bay.get("items")
+        if items is None:
+            continue
+        good = _as_dicts(items, f"{key}.items", fixes)
+        bay["items"] = good
+
+    # ---- 数字型参数 ----
+    shelves = layout.get("shelves")
+    if not isinstance(shelves, list):
+        if shelves is not None:
+            fixes.append("shelves 不是数组，已改回默认 [8,5,12,3]")
+        layout["shelves"] = [8, 5, 12, 3]
+    else:
+        clean = [size for size in (_to_int(v, 0) for v in shelves) if size > 0]
+        if len(clean) != len(shelves):
+            fixes.append(f"shelves 里有 {len(shelves) - len(clean)} 个非法值，已丢弃")
+        layout["shelves"] = clean or [8, 5, 12, 3]
+
+    for key, default in (("quantum", 2), ("page_frames", 2), ("buffer_cap", 6),
+                         ("price", 18), ("raw", 0)):
+        value = layout.get(key)
+        if value is None:
+            continue
+        fixed = _to_int(value, default, 0 if key in ("price", "raw") else 1)
+        if fixed != value:
+            fixes.append(f"{key}={value!r} 不是合法数字，已改成 {fixed}")
+            layout[key] = fixed
+
+    return fixes
+
+
 def jobs_from(layout: dict) -> list[Job]:
     raw = layout.get("jobs") or []
     shops = layout.get("shops") or []
-    shop_ids = [s["id"] for s in shops] or [""]
+    shop_ids = [str(s.get("id")) for s in shops
+                if isinstance(s, dict) and s.get("id")] or [""]
     out = []
     for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
         out.append(
             Job(
                 id=str(item.get("id") or f"j{i}"),
@@ -491,6 +625,7 @@ def simulate(layout: dict, persist_state: bool = True) -> dict:
     （tests/test_kernel.py）以前通过 simulate() 把布局落盘，跑完一轮测试就把
     演示用的工厂写成了"机器停机 + 原料只剩 12"的残局。HTTP 路径照旧落盘。
     """
+    repairs = sanitize_layout(layout)
     if persist_state:
         persist.save_layout(layout)
     shops = layout.get("shops") or []
@@ -566,10 +701,17 @@ def simulate(layout: dict, persist_state: bool = True) -> dict:
         list(layout.get("shelves") or [8, 5, 12, 3]),
         layout.get("warehouse_policy") or "best",
     )
-    route = shipping.run(
-        [job.dest for job in jobs],
-        layout.get("ship_algo") or "sstf",
-    )
+    dests = [job.dest for job in jobs]
+    route = shipping.run(dests, layout.get("ship_algo") or "sstf")
+    # 四种出货算法并排算一遍：SSTF/FCFS/SCAN/C-SCAN 的寻道长度会直接进成本，
+    # 界面上能看到"换算法省多少路"。注意起点固定为 0 时 SCAN 与 C-SCAN 的
+    # 路径其实完全相同（都在上升途中服务完），这个事实由界面如实说明。
+    route_all = {
+        algo_name: shipping.run(dests, algo_name)["distance"]
+        for algo_name in ("sstf", "fcfs", "scan", "cscan")
+    }
+    route["all"] = route_all
+    route["start"] = 0
 
     machine_n = sum(len(s.get("machines") or []) for s in shops)
     links = count_links(shops)
@@ -743,6 +885,12 @@ def simulate(layout: dict, persist_state: bool = True) -> dict:
         },
         "notes": _notes(pack, blocked, shops, machine_n, stats, floor),
     }
+    if repairs:
+        # 布局被手改坏过：如实写在结果里，别让用户以为一切正常
+        result["repairs"] = repairs
+        result["notes"] = (
+            f"布局有 {len(repairs)} 处结构不对，已按默认值处理。" + result["notes"]
+        )
     if persist_state:
         # 只存摘要。完整结果有 300KB+（timeline/compare/lab/ipc 全在里面），
         # 而守护进程每 2 秒就要 load_status() → update() → save_status()

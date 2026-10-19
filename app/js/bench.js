@@ -186,6 +186,18 @@
     const path = (sh.path || []);
     const span = Math.max(1, ...path);
     const dots = path.map((p) => `<i style="left:${(p / span * 100).toFixed(2)}%" title="${p}"></i>`).join("");
+    const all = sh.all || {};
+    const keys = Object.keys(all);
+    const names = { sstf: "SSTF 最短寻道", fcfs: "FCFS", scan: "SCAN 电梯", cscan: "C-SCAN" };
+    const cmpRows = keys.map((k) => [names[k] || k, all[k], k === sh.algo ? "← 当前" : ""]);
+    // 起点固定为 0 时，SCAN 与 C-SCAN 都在上升途中服务完所有货，结果必然相同
+    const same = all.scan !== undefined && all.scan === all.cscan;
+    const cmp = keys.length
+      ? `<h4>四种寻道算法（同一批目的地）</h4>
+         ${table(["算法", "总寻道", ""], cmpRows)}
+         ${same ? `<p class="muted">注意：起点固定为 0 时，SCAN 与 C-SCAN 都会在上升途中把货送完，
+           两者寻道长度必然相同；要看出差别，磁头得从非 0 位置出发。</p>` : ""}`
+      : "";
     return `<div class="bench-grid">
       <div><h4>出货路径 · ${esc(sh.algo)}</h4>
         ${kv([
@@ -198,6 +210,7 @@
         <div class="track">${dots}</div>
         <p class="muted">目的地当作磁道号，起点为 0。总寻道长度会按 1.2 元/格计入成本，
           所以换出货算法能改变利润。</p>
+        ${cmp}
       </div>
       <div><h4>产能与瓶颈</h4>
         ${kv([
@@ -377,8 +390,20 @@
       const result = await api("/api/simulate", "POST", layout || undefined);
       state.result = result;
       await refreshStatus();
+      // 后端会就地改写布局（消耗原料、机器停机、班次 +1）并落盘。以前前端只在
+      // 启动时读一次布局，于是"连点运行仿真永远用旧的原料数，刷新页面才变真实"。
+      // 这里把最新布局原地合并回来（Object.assign 保持引用，app.js 也能看到）。
+      try {
+        const fresh = await api("/api/layout");
+        if (window.layout && fresh && typeof fresh === "object") {
+          Object.assign(window.layout, fresh);
+          if (typeof window.renderStage === "function") window.renderStage();
+          if (typeof window.paintFaultBar === "function") window.paintFaultBar();
+        }
+      } catch (err) { /* 同步布局失败不影响仿真结果的展示 */ }
       render();
-      setHint(`良品 ${result.yield} · 利润 ${result.revenue} · 耗时 ${result.elapsed_sec}s`, "ok");
+      const extra = (result.repairs || []).length ? ` · 修正布局 ${result.repairs.length} 处` : "";
+      setHint(`良品 ${result.yield} · 利润 ${result.revenue} · 耗时 ${result.elapsed_sec}s${extra}`, "ok");
     } catch (err) {
       setHint("仿真失败：" + err.message, "bad");
     } finally {

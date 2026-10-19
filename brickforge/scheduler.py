@@ -46,6 +46,8 @@ def priority_sched(jobs: list[Job]) -> list[dict]:
 
 
 def rr(jobs: list[Job], quantum: int = 2) -> list[dict]:
+    # quantum <= 0 时切片长度为 0，remain 永远减不到 0 —— 整个循环退不出去。
+    quantum = max(int(quantum), 1)
     remain = {j.id: j.burst for j in jobs}
     first = {j.id: None for j in jobs}
     finish = {}
@@ -110,6 +112,8 @@ def srtf(jobs: list[Job]) -> list[dict]:
 def mlfq(jobs: list[Job], quanta: tuple[int, int, int] = (1, 2, 4)) -> list[dict]:
     from collections import deque
 
+    # 时间片 0 会让 slice_ 变为 0，队列永远轮不完（同 rr 的坑）
+    quanta = tuple(max(int(q), 1) for q in (tuple(quanta) + (1, 2, 4))[:3])
     queues = [deque(), deque(), deque()]
     for j in jobs:
         queues[0].append(j.id)
