@@ -148,13 +148,24 @@ def _unlock(handle):
 
 
 def load_layout() -> dict:
+    """读布局。文件缺失、损坏、或内容不是对象时，回落到默认布局。
+
+    自愈很重要：factory.json 是用户可编辑的，一旦被写成列表/半截 JSON，
+    以前会让每个 /api/simulate 都 AttributeError，只能手动删文件。
+    """
     with file_lock():
         if not LAYOUT.exists():
             return default_layout()
-        return json.loads(LAYOUT.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(LAYOUT.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return default_layout()
+        return data if isinstance(data, dict) else default_layout()
 
 
 def save_layout(layout: dict) -> dict:
+    if not isinstance(layout, dict):
+        raise ValueError("布局必须是 JSON 对象")
     with file_lock():
         _atomic_write_text(LAYOUT, json.dumps(layout, ensure_ascii=False, indent=2))
     return layout

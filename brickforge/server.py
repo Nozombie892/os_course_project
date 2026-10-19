@@ -80,28 +80,42 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        body = self._read_json()
+        try:
+            body = self._read_json()
+        except (ValueError, UnicodeDecodeError):
+            return self._bad_request("请求体不是合法 JSON")
         if path == "/api/layout":
+            # 布局必须是一个对象。以前这里不校验，传个列表也会被存进 factory.json，
+            # 之后所有 /api/simulate 都会 AttributeError，只能靠 /api/reset 救回来。
+            if body is not None and not isinstance(body, dict):
+                return self._bad_request("布局必须是 JSON 对象")
             return self._json(persist.save_layout(body or persist.load_layout()))
         if path == "/api/simulate":
+            if body is not None and not isinstance(body, dict):
+                return self._bad_request("布局必须是 JSON 对象")
             layout = body or persist.load_layout()
             persist.save_layout(layout)
             return self._json(simulate(layout))
         if path == "/api/stop":
             return self._json(emergency_stop())
         if path == "/api/run":
-            body = body or {}
-            return self._json(
-                runtime.start(
-                    float(body.get("shop_seconds") or 90),
-                    float(body.get("tick") or 0.35),
-                    body.get("layout"),
-                )
-            )
+            body = body if isinstance(body, dict) else {}
+            shop_seconds = body.get("shop_seconds")
+            tick = body.get("tick")
+            try:
+                shop_seconds = float(shop_seconds) if shop_seconds is not None else 90.0
+                tick = float(tick) if tick is not None else 0.35
+            except (TypeError, ValueError):
+                return self._bad_request("shop_seconds / tick 必须是数字")
+            layout = body.get("layout")
+            if layout is not None and not isinstance(layout, dict):
+                return self._bad_request("layout 必须是 JSON 对象")
+            return self._json(runtime.start(shop_seconds, tick, layout))
         if path == "/api/run/stop":
             return self._json(runtime.stop())
         if path == "/api/kill":
-            return self._json(runtime.kill((body or {}).get("shop_id")))
+            shop_id = body.get("shop_id") if isinstance(body, dict) else None
+            return self._json(runtime.kill(shop_id))
         if path == "/api/reset":
             return self._json(persist.save_layout(persist.default_layout()))
         self.send_error(404)
@@ -121,6 +135,15 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _bad_request(self, message: str):
+        """400：把错误当成 JSON 返回，前端能直接显示，而不是连接被掐断。"""
+        data = json.dumps({"ok": False, "error": message}, ensure_ascii=False).encode("utf-8")
+        self.send_response(400)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 

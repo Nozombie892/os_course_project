@@ -85,6 +85,8 @@ def start(shop_seconds: float = 90.0, tick: float = 0.35, layout: dict | None = 
     if current.get("state") == "running":
         return {"ok": True, "reused": True, **status()}
 
+    # 布局必须是对象：HTTP 层已拦一次，这里再兜一次，免得别的调用方传进来把服务打挂
+    layout = layout if isinstance(layout, dict) else None
     layout = layout or persist.load_layout()
     persist.save_layout(layout)
     shops = layout.get("shops") or []
