@@ -25,7 +25,7 @@ python -m brickforge
 | 虚拟内存 | `memory.py` FIFO / LRU | 实验台「内存」页步进表 |
 | 磁盘调度 | `shipping.py` SSTF / SCAN / C-SCAN | 实验台「设备」页路径图 |
 | 死锁避免 | `banker.py` 安全性算法 | 实验台「内存」页安全序列 |
-| 图形界面 | `app/` 积木画布 + **实验台** | 页面底部五个页签 |
+| 图形界面 | `app/` 积木画布 + **实验台** | 页面底部六个页签 |
 
 ## 四人分工（按答辩主讲切，不要抢文件）
 
@@ -43,7 +43,7 @@ python -m brickforge
 ## 目录
 
 - `app/` 甲 · 积木画布与实验台
-  - `app/js/bench.js` 实验台：调 `/api/simulate` 并渲染五个页签
+  - `app/js/bench.js` 实验台：调 `/api/simulate` 并渲染六个页签
 - `brickforge/scheduler.py` 乙 · 调度
 - `brickforge/sync.py` `workers.py` `ipc.py` `signals.py` 丙 · 同步 / IPC / 信号
 - `brickforge/warehouse.py` `shipping.py` `daemon.py` `persist.py` 丁 · 仓储 / 出货 / 守护
@@ -64,7 +64,7 @@ python -m brickforge
 | POST | `/api/run` | **开长跑班次**：车间进程常驻，守护进程才真有活干 |
 | GET | `/api/run` | 长跑班次视图：守护中 / 已失联 / 心跳 / 已拉起 + 日志 |
 | POST | `/api/run/stop` | 收工：停班次并清理登记（收工后守护进程不再拉起） |
-| POST | `/api/kill` | **杀掉一个车间进程**，用来现场验证守护进程会把拉起来 |
+| POST | `/api/kill` | **硬杀一个车间进程（模拟崩溃）**，用来现场验证守护进程会把它拉起来 |
 | POST | `/api/reset` | 恢复示例工厂 |
 
 ## 守护进程怎么演示（课件第 7—12 页那一项）
@@ -81,10 +81,23 @@ python -m brickforge
 右侧 `daemon.log` 出现：
 
 ```text
-13:35:57 测谎：主动杀掉车间 s1 pid=33260（TerminateProcess），等守护进程拉起
-13:35:58 车间 s1 进程 pid=33260 已失联，拉起新进程 pid=600（第 1 次）
+13:35:57 测谎：硬杀车间 s1 pid=33260（TerminateProcess，模拟崩溃），等守护进程拉起
+13:35:58 车间 s1 进程 pid=33260 已失联，拉起新进程 pid=600（第 1 次）—— 离线运行：不参与上下游管道
 13:35:58 巡视 守护=2 异常退出=1 心跳过期=无 累计拉起=1
 ```
+
+**两个必须讲清楚的点（答辩会被问）：**
+
+1. **必须"硬杀"**。如果发 `SIGTERM`，车间进程的处理程序会接住、正常注销，
+   守护进程只会认为它下班了，永远不拉起。所以 `kill()` 在 POSIX 上用
+   **SIGKILL**（不可捕获）、Windows 上用 **TerminateProcess**。这一点在
+   Windows 上验证通过**不代表** Linux 上成立 —— Windows 的 `SIGTERM`
+   恰好就等于 `TerminateProcess`。
+2. **被拉起的车间是"离线"的**。管道端点和跨进程信号量只在其创建者的进程树内
+   有效，守护进程没法把仍在运行的上下游手里那些旧端点换掉。所以拉起的新进程
+   照常消化工单、写共享内存看板、也能被再次杀死/拉起，但**不参与上下游管道
+   投递**。要真正做到"拉起后拓扑仍通"，得把每条边换成 `Manager` 里的命名
+   队列并把地址写进 `run.json`（约半天工作量），本版本没做。
 
 命令行等价操作：
 

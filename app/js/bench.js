@@ -3,7 +3,7 @@
  * 原项目里 lab.* 这些字段只存在于 API 返回的 JSON 中，界面从不展示。
  * 本文件补上这一环：点「运行仿真」调用 POST /api/simulate，
  * 后端真的跑一遍调度 / 银行家 / 页面置换 / 仓储 / 管道 / 共享内存，
- * 结果分五个标签页渲染出来。
+ * 结果分六个标签页渲染出来（守护页是后加的）。
  *
  * 不修改 app.js：只读取它维护的 window.layout。
  */
@@ -243,7 +243,7 @@
     const rows = procs.map((p) => [
       p.pid, p.shop_id, p.name, p.state === "running" ? "运行中" : "已失联",
       p.heartbeat_age == null ? "—" : p.heartbeat_age + "s", p.revives,
-      p.state === "running" ? `<button type="button" class="kill" data-shop="${esc(p.shop_id)}">杀掉它</button>` : "—",
+      p.state === "running" ? `<button type="button" class="kill" data-shop="${esc(p.shop_id)}">硬杀它</button>` : "—",
     ]);
     const head = `<div class="run-bar">
       <span class="run-pill ${run.state === "running" ? "on" : ""}">班次：${run.state === "running" ? "生产中" : "空闲"}</span>
@@ -262,7 +262,7 @@
             : `<p class="muted">还没有班次。点「开始长跑生产」：每个车间会起一个常驻进程，
                 守护进程每 2 秒巡视一次；然后点「杀掉一个车间」，2 秒内它就会按登记信息被拉起。</p>`}
           <p class="muted">这就是课件第 7—12 页要求的守护进程：<b>确保指定进程运行</b>。
-            杀掉进程 = 软件崩溃，拉起 = 守护进程帮你重启。日志见右侧。</p>
+            硬杀进程 = 软件崩溃，拉起 = 守护进程帮你重启。必须用 SIGKILL/TerminateProcess，发 SIGTERM 会被进程接住、正常注销，就不会拉起了。日志见右侧。</p>
         </div>
         <div><h4>data/daemon.log（最近 ${log.length} 行）</h4>
           <pre class="bench-sys">${esc(log.join("\n") || "（还没有日志）")}</pre>
@@ -328,7 +328,7 @@
     if (kill) kill.addEventListener("click", async () => {
       try {
         const res = await api("/api/kill", "POST", {});
-        setHint(res.ok ? `已杀掉 ${res.killed.shop_id}（pid ${res.killed.pid}），等守护进程 2 秒内拉起` : (res.error || "没有可杀的进程"),
+        setHint(res.ok ? `已硬杀 ${res.killed.shop_id}（pid ${res.killed.pid}，模拟崩溃），等守护进程 2 秒内拉起` : (res.error || "没有可杀的进程"),
           res.ok ? "ok" : "bad");
         await refreshRun();
         render();
@@ -357,7 +357,7 @@
       btn.addEventListener("click", async () => {
         try {
           const res = await api("/api/kill", "POST", { shop_id: btn.dataset.shop });
-          setHint(res.ok ? `已杀掉车间 ${btn.dataset.shop}，等守护进程拉起` : (res.error || "失败"),
+          setHint(res.ok ? `已硬杀车间 ${btn.dataset.shop}（模拟崩溃），等守护进程拉起` : (res.error || "失败"),
             res.ok ? "ok" : "bad");
           await refreshRun();
           render();
