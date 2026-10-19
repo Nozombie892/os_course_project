@@ -93,12 +93,13 @@ def syscalls(
     # 信号量与信号
     lines.append(f"sem_init(库位, {slots})")
     if blocked:
-        lines.append(f"sem_wait() 阻塞 {blocked} 次 EAGAIN")
+        # 现在统计的是"真的排队等过"，不是"等到超时失败"，所以不再写 EAGAIN
+        lines.append(f"sem_wait(库位) 排队等待 {blocked} 次（库位被别的机器占着）")
     else:
         lines.append("sem_wait()/sem_post() 库位未饿死")
     lines.append(f"sem_init(共享工装, 2) 线程互斥资源")
     if tool_waits:
-        lines.append(f"sem_wait(共享工装) 等待超时 {tool_waits} 次")
+        lines.append(f"sem_wait(共享工装) 排队等待 {tool_waits} 次")
     else:
         lines.append("sem_wait/sem_post(共享工装) 线程间未争抢")
 

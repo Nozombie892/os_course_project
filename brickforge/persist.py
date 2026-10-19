@@ -21,6 +21,10 @@ PID_FILE = DATA / "daemon.pid"
 RUN = DATA / "run.json"          # 长跑（持续生产）班次状态
 WATCHDOG = DATA / "watchdog.json"  # 守护进程反过来盯"主人"（HTTP 服务）是否还活着
 
+# 守护进程每 2 秒写一行日志，挂一天就是几万行。超过上限就裁到只剩尾巴。
+LOG_MAX_BYTES = 512 * 1024
+LOG_KEEP_LINES = 400
+
 
 def write_watchdog(pid: int | None = None) -> None:
     """服务端周期性写一次"我还活着"，守护进程读它判断主人是否已经走了。
@@ -191,18 +195,36 @@ def load_status() -> dict:
             return {}
 
 
+def _trim_log() -> None:
+    """日志超过上限时只留最后 LOG_KEEP_LINES 行。
+
+    调用方必须已经持有文件锁（append_log 在锁内调用）。这里用原地重写而不是
+    原子替换：替换会撞上并发读取 tail_log() 的句柄，Windows 上会 WinError 5，
+    而日志裁歪几行无所谓。
+    """
+    try:
+        if DAEMON_LOG.stat().st_size <= LOG_MAX_BYTES:
+            return
+        lines = DAEMON_LOG.read_text(encoding="utf-8").splitlines()
+        with DAEMON_LOG.open("w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines[-LOG_KEEP_LINES:]) + "\n")
+    except OSError:
+        pass
+
+
 def append_log(line: str, retries: int = 3) -> bool:
     """追加一行日志。
 
     文件锁在 Windows 上是"重试 10 次后抛异常"的语义，而守护进程每 2 秒就要
     写一次日志、还要和仿真进程抢同一把锁。这里做有限重试并吞掉异常，
-    避免一次抢锁失败把守护进程的主循环打穿。
+    避免一次抢锁失败把守护进程的主循环打穿。写到一定体积会自动裁剪。
     """
     for attempt in range(max(retries, 1)):
         try:
             with file_lock():
                 with DAEMON_LOG.open("a", encoding="utf-8") as fh:
                     fh.write(line.rstrip() + "\n")
+                _trim_log()
             return True
         except OSError:
             time.sleep(0.05 * (attempt + 1))

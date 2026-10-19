@@ -23,7 +23,9 @@ from brickforge import ipc, signals
 from brickforge.persist import HB_DIR, register_proc, unregister_proc
 
 TOOL_SLOTS = 2          # 一个车间里共享工装的数量（线程互斥资源）
+MATERIAL_WAIT = 0.4     # 抢不到库位的等待上限（秒）
 TOOL_WAIT = 1.0         # 抢不到工装的等待上限（秒）
+WAIT_EPSILON = 0.005    # 等超过 5 毫秒就算"被挡了一下"，计入阻塞
 
 
 def beat(shop_id: str) -> None:
@@ -49,6 +51,20 @@ def run_alive(run_id: str | None) -> bool:
         return persist.active_run_id() == run_id
     except Exception:
         return False
+
+
+def _timed_acquire(sem, timeout: float) -> tuple[bool, float]:
+    """抢一个信号量，返回（是否抢到，实际等了多久/秒）。
+
+    以前只在 acquire **超时**时才计一次"阻塞"。可默认工单只占库位 0.17 秒，
+    等一会儿总能抢到，于是 blocked 永远是 0——README 演示脚本"把货架改成
+    1 个槽就能看到阻塞"根本不成立。
+
+    改成度量真实等待时间：只要真的等过，就说明确实被别的机器挡了一下。
+    """
+    started = time.monotonic()
+    got = sem.acquire(timeout=timeout)
+    return bool(got), time.monotonic() - started
 
 
 def shop_worker(
@@ -159,15 +175,19 @@ def shop_worker(
                 return
             beat(shop_id)
             # 同步一：抢占库位（跨进程信号量）
-            if not material.acquire(timeout=0.4):
+            got, waited = _timed_acquire(material, MATERIAL_WAIT)
+            if waited > WAIT_EPSILON:
                 with state_lock:
                     blocked += 1
+            if not got:
                 continue
             try:
                 # 同步二：抢占车间共享工装（线程信号量 → 互斥）
-                if not tools.acquire(timeout=TOOL_WAIT):
+                got, waited = _timed_acquire(tools, TOOL_WAIT)
+                if waited > WAIT_EPSILON:
                     with state_lock:
                         tool_waits += 1
+                if not got:
                     continue
                 try:
                     staff = max(int(machine.get("workers") or 0), 0)

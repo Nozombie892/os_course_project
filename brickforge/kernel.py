@@ -484,8 +484,15 @@ def jobs_from(layout: dict) -> list[Job]:
     return out
 
 
-def simulate(layout: dict) -> dict:
-    persist.save_layout(layout)
+def simulate(layout: dict, persist_state: bool = True) -> dict:
+    """跑一轮仿真。
+
+    persist_state=False 时**不碰 data/factory.json 和 status.json**：自测脚本
+    （tests/test_kernel.py）以前通过 simulate() 把布局落盘，跑完一轮测试就把
+    演示用的工厂写成了"机器停机 + 原料只剩 12"的残局。HTTP 路径照旧落盘。
+    """
+    if persist_state:
+        persist.save_layout(layout)
     shops = layout.get("shops") or []
     jobs = jobs_from(layout)
     algo = layout.get("scheduler") or "priority"
@@ -650,7 +657,8 @@ def simulate(layout: dict) -> dict:
         for machine in shop.get("machines") or []:
             if machine.get("id") in new_broken:
                 machine["broken"] = True
-    persist.save_layout(layout)
+    if persist_state:
+        persist.save_layout(layout)
 
     already = [m.get("id") for s in shops for m in (s.get("machines") or []) if m.get("broken")]
     floor = {
@@ -735,7 +743,25 @@ def simulate(layout: dict) -> dict:
         },
         "notes": _notes(pack, blocked, shops, machine_n, stats, floor),
     }
-    persist.save_status({**persist.load_status(), "last_sim": result})
+    if persist_state:
+        # 只存摘要。完整结果有 300KB+（timeline/compare/lab/ipc 全在里面），
+        # 而守护进程每 2 秒就要 load_status() → update() → save_status()
+        # 整份重写一遍 status.json，8 车间 200 工单时那个文件涨到 815KB。
+        persist.save_status({
+            **persist.load_status(),
+            "last_sim": {
+                "at": round(time.time(), 3),
+                "shift_no": shift_no,
+                "scheduler": algo,
+                "yield": result["yield"],
+                "revenue": result["revenue"],
+                "cost": result["cost"],
+                "price": result["price"],
+                "scrap": result["scrap"],
+                "broken": floor["broken"],
+                "notes": result["notes"],
+            },
+        })
     return result
 
 

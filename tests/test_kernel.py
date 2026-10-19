@@ -9,7 +9,7 @@ def test_fanout_and_raw():
     stats = production_stats(layout["shops"], layout)
     assert stats["belts"] == 2
     assert stats["throughput"] > 0
-    result = simulate(layout)
+    result = simulate(layout, persist_state=False)
     assert result["ok"]
     prod = result["production"]
     assert prod["raw_name"] == "冷轧钢板"
