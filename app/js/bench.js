@@ -15,7 +15,7 @@
 
   const PARAMS = [
     { key: "scheduler", label: "处理机调度", type: "select",
-      options: [["fcfs", "FCFS 先来先服务"], ["sjf", "SJF 短作业优先"], ["priority", "动态优先级"],
+      options: [["fcfs", "FCFS 先来先服务"], ["sjf", "SJF 短作业优先"], ["priority", "优先级（静态）"],
                 ["rr", "RR 时间片轮转"], ["srtf", "SRTF 最短剩余"], ["mlfq", "MLFQ 多级反馈"]] },
     { key: "quantum", label: "时间片", type: "number", min: 1 },
     { key: "ship_algo", label: "出货路径（磁盘调度）", type: "select",

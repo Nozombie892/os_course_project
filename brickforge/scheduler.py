@@ -9,7 +9,7 @@ ALGOS = ("fcfs", "sjf", "priority", "rr", "srtf", "mlfq")
 ALGO_NAME = {
     "fcfs": "FCFS 先到先服务",
     "sjf": "SJF 短作业优先",
-    "priority": "动态优先级",
+    "priority": "优先级（静态）",
     "rr": "RR 时间片轮转",
     "srtf": "SRTF 最短剩余",
     "mlfq": "MLFQ 多级反馈",
