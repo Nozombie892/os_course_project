@@ -98,10 +98,7 @@ def srtf(jobs: list[Job]) -> list[dict]:
         _add_slice(slices, cur.id, t, t + 1)
         remain[cur.id] -= 1
         t += 1
-        # 用 <= 0 而不是 == 0：burst 若是负数（布局文件是手改的），减 1 永远
-        # 到不了 0，会把调用它的线程钉在这里空转。kernel.jobs_from 已在入口
-        # 把 burst 夹到 >=1，这里是给直接构造 Job 的调用方兜底。
-        if remain[cur.id] <= 0:
+        if remain[cur.id] == 0:
             finish[cur.id] = t
             del remain[cur.id]
     return [_row(catalog[j.id], first[j.id] or 0, finish[j.id], slices[j.id]) for j in jobs]
