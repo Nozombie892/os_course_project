@@ -444,6 +444,26 @@ def pile_tone(qty: float, cap: float) -> dict:
     return {"key": "ok", "text": "畅通"}
 
 
+def _to_int(value, default: int, minimum: int | None = None) -> int:
+    """把布局里来的数字解析成整数，坏值一律回落默认值。
+
+    jobs 是用户可编辑的（手改 factory.json，或直接 POST 一份布局），所以不能
+    直接 int()：`"abc"` 会抛 ValueError 把整个 /api/simulate 打成 500，
+    `-5` 会让 SRTF 的"剩余时间减到 0 为止"永远减不到 0，卡死一个 HTTP 线程
+    （见 scheduler.srtf 的防护）。这里统一兜住，并允许 float/数字字符串。
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        try:
+            number = int(float(value))
+        except (TypeError, ValueError):
+            number = int(default)
+    if minimum is not None:
+        number = max(number, minimum)
+    return number
+
+
 def jobs_from(layout: dict) -> list[Job]:
     raw = layout.get("jobs") or []
     shops = layout.get("shops") or []
@@ -454,9 +474,10 @@ def jobs_from(layout: dict) -> list[Job]:
             Job(
                 id=str(item.get("id") or f"j{i}"),
                 name=item.get("name") or f"工单{i+1}",
-                burst=int(item.get("burst") or 3),
-                priority=int(item.get("priority") or 2),
-                dest=int(item.get("dest") or 0),
+                # burst 至少 1 拍：0 或负数在调度/仓储/银行家里都没有意义
+                burst=_to_int(item.get("burst"), 3, 1),
+                priority=_to_int(item.get("priority"), 2),
+                dest=_to_int(item.get("dest"), 0),
                 shop_id=shop_ids[i % len(shop_ids)],
             )
         )
@@ -718,11 +739,35 @@ def simulate(layout: dict) -> dict:
     return result
 
 
+def _down_names(shops: list[dict], floor: dict) -> list[str]:
+    """把停机机器按「车间」的「机器」列出来，给结算/提示用。"""
+    down_ids = {str(mid) for mid in (floor.get("broken") or []) if mid}
+    if not down_ids:
+        return []
+    names = []
+    for shop in shops:
+        for machine in shop.get("machines") or []:
+            if str(machine.get("id")) not in down_ids:
+                continue
+            shop_name = shop.get("name") or shop.get("id") or "车间"
+            machine_name = machine.get("name") or machine.get("id") or "机器"
+            names.append(f"「{shop_name}」的「{machine_name}」")
+    if len(names) > 3:
+        names = names[:3] + [f"等 {len(names)} 台"]
+    return names
+
+
 def _notes(pack, blocked, shops, machine_n, stats, floor) -> str:
     bits = [f"本轮良品 {stats.get('pieces', 0)} 件，次品 {stats.get('scrap', 0)}。"]
     bits.append(f"工资 {floor.get('wages', 0)}。")
     if (stats.get("throughput") or 0) <= 0:
-        bits.append("流水线没接通，物料到不了出货区。")
+        # 机器停机也会让产量归零。以前不分青红皂白说"流水线没接通"，
+        # 用户会跑去拆传送带，而真正该做的是去故障条里把那台机器修好。
+        down = _down_names(shops, floor)
+        if down:
+            bits.append(f"{'、'.join(down)}停机，成品出不了货；先修好再跑。")
+        else:
+            bits.append("流水线没接通，物料到不了出货区。")
     if stats.get("bottleneck"):
         bits.append(f"卡线在「{stats['bottleneck']}」。")
     if floor.get("new_broken"):
