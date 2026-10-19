@@ -147,27 +147,25 @@ def start(shop_seconds: float = 90.0, tick: float = 0.35, layout: dict | None = 
 
 
 def kill(shop_id: str | None = None) -> dict:
-    """杀掉一个在册的车间进程，用来验证守护进程会把它拉起来。
+    """模拟"车间进程崩溃"：硬杀掉一个在册车间，验证守护进程会把它拉起来。
 
     不给 shop_id 就挑第一个活着的车间。
+
+    必须用不可捕获的杀法（POSIX SIGKILL / Windows TerminateProcess）：
+    如果发 SIGTERM，车间进程的处理程序会接住、优雅退出并注销登记，
+    守护进程只会认为它正常下班了，**永远不会拉起**。这一点在 Linux 上
+    尤其要小心 —— Windows 上 SIGTERM 恰好等于 TerminateProcess，所以
+    在 Windows 上验证通过不代表 Linux 上成立。
     """
     rows = [r for r in status()["guarded"] if r.get("pid")]
     if not rows:
         return {"ok": False, "error": "当前没有正在运行的车间进程，先开一个长跑班次"}
     target = next((r for r in rows if shop_id and r.get("shop_id") == shop_id), rows[0])
     pid = int(target["pid"])
-    mode = "SIGTERM" if not signals.IS_WINDOWS else "TerminateProcess"
-    ok = signals.SignalHub("kill").send(pid, signals.STOP)
-    if not ok and signals.IS_WINDOWS:
-        # Windows 上 SIGTERM 走不通时用 taskkill 兜底
-        try:
-            os.kill(pid, 15)
-            ok = True
-        except OSError:
-            ok = False
+    ok, mode = signals.hard_kill(pid)
     persist.append_log(
-        f"{time.strftime('%H:%M:%S')} 测谎：主动杀掉车间 {target.get('shop_id')} "
-        f"pid={pid}（{mode}），等守护进程拉起"
+        f"{time.strftime('%H:%M:%S')} 测谎：硬杀车间 {target.get('shop_id')} "
+        f"pid={pid}（{mode}，模拟崩溃），等守护进程拉起"
     )
     return {"ok": bool(ok), "killed": target, "mode": mode}
 

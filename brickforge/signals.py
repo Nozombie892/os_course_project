@@ -31,11 +31,12 @@ import threading
 IS_WINDOWS = os.name == "nt"
 
 # ---------------------------------------------------------------- 语义信号 ---
-STOP = "stop"      # 急停：停止当前班次
+STOP = "stop"      # 急停：停止当前班次（可捕获，优雅收尾）
 RELOAD = "reload"  # 换班：重新读取布局
 TICK = "tick"      # 心跳：周期任务
+CRASH = "crash"    # 模拟崩溃：不可捕获，进程当场死掉（用于验证守护进程拉起）
 
-_ALL = (STOP, RELOAD, TICK)
+_ALL = (STOP, RELOAD, TICK, CRASH)
 
 
 def resolve(name: str) -> int | None:
@@ -51,7 +52,39 @@ def resolve(name: str) -> int | None:
         return None
     if name == TICK:
         return getattr(signal, "SIGALRM", None)
+    if name == CRASH:
+        # POSIX 用 SIGKILL：不可捕获、不可忽略，进程当场死亡，登记表留着 → 守护进程才会拉起。
+        # Windows 没有 SIGKILL，os.kill(pid, SIGTERM) 等价于 TerminateProcess，效果相同。
+        return getattr(signal, "SIGKILL", getattr(signal, "SIGTERM", None))
     return None
+
+
+def hard_kill(pid: int) -> tuple[bool, str]:
+    """模拟"进程崩溃"：把它当场打死，不给它优雅收尾的机会。
+
+    这是"守护进程演示"的关键：如果用 SIGTERM，车间进程的处理程序会接住、
+    正常注销、守护进程会认为它只是下班了，永远不会拉起。只有 SIGKILL
+    （Windows 上是 TerminateProcess）才是真正的"崩溃"。
+
+    返回 (是否成功, 实际用的手段名)。
+    """
+    if not pid or pid <= 0:
+        return False, "无效 pid"
+    if IS_WINDOWS:
+        # CPython 在 Windows 上把任意 kill 都变成 TerminateProcess(handle, sig)
+        try:
+            os.kill(pid, int(getattr(signal, "SIGTERM", 15)))
+            return True, "TerminateProcess"
+        except OSError:
+            return False, "TerminateProcess"
+    sig = getattr(signal, "SIGKILL", None)
+    if sig is None:                                  # pragma: no cover
+        return False, "SIGKILL 不可用"
+    try:
+        os.kill(pid, sig)
+        return True, "SIGKILL"
+    except OSError:
+        return False, "SIGKILL"
 
 
 def signal_name(sig: int) -> str:
@@ -176,6 +209,9 @@ class SignalHub:
     # ------------------------------------------------------------ 发送端 ---
     def send(self, pid: int, name: str = STOP) -> bool:
         """给指定进程发信号。Windows 上 SIGTERM 会直接终止目标进程。"""
+        if name == CRASH:
+            ok, _ = hard_kill(pid)
+            return ok
         sig = resolve(name)
         if sig is None or pid <= 0:
             return False
