@@ -81,14 +81,37 @@ def _atomic_write_text(path: Path, text: str, sync: bool = False) -> None:
 
 
 @contextmanager
-def file_lock():
+def file_lock(retries: int = 200, delay: float = 0.02):
+    """跨平台排他锁。
+
+    用**非阻塞**加锁 + 自己重试，而不是让系统调用自己去等：
+
+        - msvcrt.locking(LK_LOCK) 是"重试约 10 次、每次 1 秒，然后抛 OSError"，
+          意味着一次调用最坏要等 10 秒；
+        - fcntl.flock(LOCK_EX) 则是无限阻塞。
+
+    两者行为不一致还没法控制总时长。改成 LOCK_NB / LK_NBLCK（抢不到立刻
+    返回）之后，重试节奏由这里决定：默认最多 200 次 × 20ms ≈ 4 秒，
+    仿真高峰时守护进程、车间进程、HTTP 请求抢同一把锁也不会偶发 500。
+    """
     LOCK.parent.mkdir(exist_ok=True)
     handle = open(LOCK, "a+b")
+    locked = False
+    attempts = max(int(retries), 1)
     try:
-        _lock(handle)
+        for attempt in range(attempts):
+            try:
+                _lock(handle)
+                locked = True
+                break
+            except OSError:
+                if attempt + 1 >= attempts:
+                    raise
+                time.sleep(delay)
         yield
     finally:
-        _unlock(handle)
+        if locked:
+            _unlock(handle)
         handle.close()
 
 
@@ -101,11 +124,12 @@ def _lock(handle):
     if os.name == "nt":
         import msvcrt
 
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        # LK_NBLCK：抢不到立刻抛 OSError，由 file_lock 决定重试节奏
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
     else:
         import fcntl
 
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 def _unlock(handle):
@@ -376,8 +400,13 @@ def default_layout() -> dict:
         "shelves": [8, 5, 12, 3],
         "buffer_cap": 6,
         "quantum": 2,
-        "page_frames": 4,
+        # 页框故意设小：默认引用串只有 3 个不同页，4 个页框时一次换出都不会发生，
+        # LRU 和 FIFO 结果完全一样，演示不出置换算法。2 个页框才有区别（实测 LRU 6/FIFO 5 次缺页）。
+        "page_frames": 2,
         "page_algo": "lru",
+        # 银行家算法的初始可用资源。默认作业集下 [4,5,3] 判定为不安全（安全序列为空），
+        # 演示不出"安全性检查"的价值；[5,6,4] 能给出完整安全序列（急单→普通→加急）。
+        "bank_available": [5, 6, 4],
         "inbound": {
             "items": [{"id": "in1", "name": "冷轧钢板", "qty": 120, "cap": 3000, "cost": 2}]
         },

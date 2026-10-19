@@ -473,7 +473,10 @@ def simulate(layout: dict) -> dict:
     sched_m = scheduler.metrics(timeline)
     compare = scheduler.compare(jobs, quantum)
     buffers = sync.line_buffers(shops, layout.get("buffer_cap") or 6)
-    bank = banker.snapshot(jobs)
+    # 可用资源可由布局给出：[5,6,4] 是"安全"示例，[4,5,3] 是"不安全"示例，
+    # 方便答辩做对照（不给就沿用 banker 的默认值）。
+    bank_available = layout.get("bank_available")
+    bank = banker.snapshot(jobs, bank_available if isinstance(bank_available, list) else None)
     refs = [int(job.dest or i + 1) for i, job in enumerate(jobs)]
     if refs:
         refs = refs + [refs[0]] + list(reversed(refs))
