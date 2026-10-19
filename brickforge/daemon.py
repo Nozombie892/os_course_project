@@ -154,19 +154,18 @@ def _redirect_std_to_devnull() -> None:
 
 
 # ------------------------------------------------------------------ 拉起 ---
-def _rebuild_pipes(links: list[dict]) -> tuple[dict, dict[str, list]]:
-    """按登记里的连线重建管道拓扑，返回 (管道包, 各车间写端)。
-
-    原先拉起时 senders/receivers 传的是空列表，被拉起的车间就成了"孤岛"：
-    既不往下游投递，也收不到上游的批次。这里按 data/factory.json 的 links
-    重新建一套，把该车间的写端接回去。
-    """
-    bundle = ipc.make_pipes(links or [])
-    return bundle, dict(bundle.get("senders") or {})
-
-
 def revive(entry: dict) -> Process | None:
-    """按登记信息真正重启一个车间进程。"""
+    """按登记信息真正重启一个车间进程。
+
+    **诚实说明：拉起的车间是"离线"的。**
+    管道端点（multiprocessing.Pipe）和跨进程信号量都只在其创建者的进程树内有效，
+    守护进程无法把正在运行的上下游车间手里的旧端点换成新的。所以这里不假装
+    复原拓扑，`senders/receivers` 一律留空、信号量新建一个：
+        - 被拉起的车间照常消化工单、写共享内存看板、能被再次杀死/拉起；
+        - 但它不参与上下游管道投递，库位互斥也只是和它自己那一个信号量有关。
+    要真正做到"拉起后拓扑仍通"，需要把每条边换成 Manager 里的命名队列、
+    并把 Manager 地址写进 run.json（工作量约半天），本阶段不做。
+    """
     from brickforge.workers import shop_worker
 
     shop = entry.get("shop") or {}
@@ -174,24 +173,20 @@ def revive(entry: dict) -> Process | None:
         return None
     slots = max(int(entry.get("slots") or 1), 1)
     shop_id = str(shop.get("id"))
-    bundle = None
     try:
         material = Semaphore(slots)
         report_q: Queue = Queue()
-        # 上下文要按登记信息复原：槽位、连线、班次、寿命模型
-        links = list(entry.get("links") or [])
-        sender_map: dict = {}
-        if links:
-            bundle, sender_map = _rebuild_pipes(links)
         ctx = {
             "index": int(entry.get("index") or 0),
             "slots": slots,
-            "senders": sender_map.get(shop_id, []),
-            "receivers": (bundle.get("receivers") or {}).get(shop_id, []) if bundle else [],
+            # 不传管道：见 docstring，拉起后无法接回旧端点
+            "senders": [],
+            "receivers": [],
             "revives": int(entry.get("revives") or 0) + 1,
             "run_id": entry.get("run_id"),
             "run_seconds": float(entry.get("run_seconds") or 0.0),
-            "links": links,
+            "links": list(entry.get("links") or []),
+            "isolated": True,
         }
         proc = Process(
             target=shop_worker,
@@ -201,13 +196,8 @@ def revive(entry: dict) -> Process | None:
         )
         proc.daemon = False
         proc.start()
-        if bundle:
-            # 子进程已经拿到自己的端点副本，父进程这份要关掉，否则句柄泄漏
-            ipc.close_pipes(bundle)
         return proc
     except (OSError, ValueError):
-        if bundle:
-            ipc.close_pipes(bundle)
         return None
 
 
@@ -292,7 +282,8 @@ def daemon_loop(interval: float = 2.0) -> None:
                         entry, pid=proc.pid, revives=done + 1, started_at=time.time()
                     ))
                     append_log(f"{now} 车间 {shop_id} 进程 pid={old_pid} 已失联，"
-                               f"拉起新进程 pid={proc.pid}（第 {done + 1} 次）")
+                               f"拉起新进程 pid={proc.pid}（第 {done + 1} 次）"
+                               f"—— 离线运行：不参与上下游管道")
                 else:
                     append_log(f"{now} 车间 {shop_id} 拉起失败")
 

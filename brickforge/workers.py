@@ -237,6 +237,8 @@ def shop_worker(
             "pid": my_pid,
             "run_id": run_id,
             "long_run": long_run,
+            # 被守护进程拉起时是"离线"的（拿不到原来的管道与信号量），如实标记
+            "isolated": bool(ctx.get("isolated")),
         }
     )
     # ---- 正常结束：注销登记，守护进程不会把我误判成崩溃 ---------------------
